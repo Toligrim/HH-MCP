@@ -1,0 +1,18 @@
+[Unit]
+Description=HH-MCP read-only HeadHunter MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hh-mcp
+Group=hh-mcp
+WorkingDirectory=/opt/hh-mcp
+EnvironmentFile=/etc/hh-mcp/hh-mcp.env
+ExecStart=/usr/bin/node /opt/hh-mcp/dist/index.js --http
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

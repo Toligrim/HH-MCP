@@ -1,14 +1,11 @@
-# HH-MCP ops preflight package
+# HH-MCP operations record
 
-This branch contains the reviewed deployment candidate source snapshot and the Raspberry Pi deployment preflight evidence collected on 2026-10-13.
+This ops branch records deployment of the exact upstream candidate `98f9930a1bbeeed44572986c7d72b197cacc93e2` to the Raspberry Pi host on 2026-10-13. The application source was not modified. No GitHub Actions workflow ran, and nothing was merged.
 
-## Contents
+## Deployment artifacts
 
-- `HH-MCP-DEPLOYMENT-STATUS.md` — detailed host, source, service, tunnel, test, security, blocker, and rollback status.
-- `candidate-source/` — tracked repository files exported from the exact candidate SHA recorded in `SOURCE-CANDIDATE.txt`.
-- `logs/` — npm install, typecheck, lint, test, build, and temporary local server logs.
-- `build-output/dist/` — output produced by the candidate's `npm run build`.
+- `HH-MCP-DEPLOYMENT-STATUS.md` — final deployment report, acceptance evidence, audit reachability review, and rollback steps.
+- `deployment/2026-10-13/` — sanitized systemd, env example, Cloudflare and sing-box fragments, run summary, and npm logs/audit JSON.
+- `candidate-source/`, `build-output/`, and `SOURCE-CANDIDATE.txt` — the previously reviewed exact candidate snapshot.
 
-The preflight did not install or publish a production service. The report records the blockers and the checks that passed or failed. Generated `node_modules` and Git object metadata are omitted; dependencies can be recreated with `npm ci` from the included lockfile.
-
-The source snapshot is nested under `candidate-source/`, so its upstream `.github/workflows` file is not a workflow at this repository's root. This upload does not run GitHub Actions.
+The production application is installed at `/opt/hh-mcp`, listens only on `127.0.0.1:3001`, and is exposed through the existing Cloudflare Tunnel as `https://hh-mcp.kurva-cloud.ru`. HH application credentials are stored only in `/etc/hh-mcp/hh-mcp.env`; no token or cloud credentials are included here.

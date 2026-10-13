@@ -1,0 +1,28 @@
+{
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct-hh",
+      "domain_resolver": { "server": "local" },
+      "bind_interface": "wlan0"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff",
+        "inbound": ["tun-in"],
+        "network": "tcp",
+        "port": [443]
+      },
+      {
+        "action": "route",
+        "domain": ["api.hh.ru"],
+        "inbound": ["tun-in"],
+        "network": "tcp",
+        "port": [443],
+        "outbound": "direct-hh"
+      }
+    ]
+  }
+}

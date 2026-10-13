@@ -1,0 +1,4 @@
+ingress:
+  - hostname: hh-mcp.kurva-cloud.ru
+    service: http://127.0.0.1:3001
+  - service: http_status:404
