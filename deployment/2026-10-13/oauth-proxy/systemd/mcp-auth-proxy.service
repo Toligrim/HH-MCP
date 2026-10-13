@@ -1,0 +1,32 @@
+[Unit]
+Description=OAuth 2.1 authentication proxy for HH-MCP
+After=network-online.target hh-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcp-auth-proxy
+Group=mcp-auth-proxy
+EnvironmentFile=/etc/mcp-auth-proxy/mcp-auth-proxy.env
+WorkingDirectory=/var/lib/mcp-auth-proxy
+ExecStart=/usr/local/bin/mcp-auth-proxy http://127.0.0.1:3001
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/mcp-auth-proxy
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
