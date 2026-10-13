@@ -27,4 +27,4 @@ Deployment and controlled Cloudflare cutover completed. Public MCP requests now 
 - Post-cutover config SHA-256: `13ed80bed8c2e43e81856a0daad8f3f0a43c76797492b2ea27273fc25cf15d8f`; ingress validation passed and `cloudflared.service` is active.
 - Rollback procedure is ready in `rollback.md`; it restores only the recorded config backup and preserves proxy state and keys.
 
-All five required services are active: `hh-mcp`, `mcp-auth-proxy`, `cloudflared`, `sing-box-host`, and `fable`. The ops branch is `ops/preflight-2026-10-13`; evidence is prepared for commit and push. No merge or GitHub Actions run was performed.
+All five required services are active: `hh-mcp`, `mcp-auth-proxy`, `cloudflared`, `sing-box-host`, and `fable`. Deployment evidence is committed and pushed to `ops/preflight-2026-10-13`. No merge or GitHub Actions run was performed.
