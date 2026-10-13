@@ -1,0 +1,1 @@
+[hh-mcp] HTTP mode on 127.0.0.1:3001 (24 tools, filtered). resumeBudget minIntervalMs=1500 maxConcurrency=1 shared=true. Endpoint: POST /mcp, health: GET /health

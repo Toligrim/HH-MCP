@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.tgz
+
+# Secrets / local config
+.env
+.env.local
+.env.*.local
+.npmrc
+.npmrc.*
+
+# local smoke artefacts
+.tmp-smoke-export/

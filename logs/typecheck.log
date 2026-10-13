@@ -1,0 +1,4 @@
+
+> @andrey-tepaykin/hh-mcp@3.1.0 typecheck
+> tsc --noEmit
+
