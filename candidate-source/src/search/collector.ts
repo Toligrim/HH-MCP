@@ -122,7 +122,7 @@ function validateCheckpoint(value: unknown, plan: SearchPlan): CollectorCheckpoi
     const leftTo = dateMs(left!.date_to)!;
     const rightFrom = dateMs(right!.date_from)!;
     const rightTo = dateMs(right!.date_to)!;
-    if (leftFrom !== parentFrom || rightTo !== parentTo || leftTo < rightFrom || leftFrom >= leftTo || rightFrom >= rightTo || leftTo - leftFrom >= parentTo - parentFrom || rightTo - rightFrom >= parentTo - parentFrom) throw new Error("invalid checkpoint split coverage bounds");
+    if (leftFrom !== parentFrom || rightTo !== parentTo || leftTo - rightFrom < MIN_INTERVAL_MS || leftFrom >= leftTo || rightFrom >= rightTo || leftTo - leftFrom >= parentTo - parentFrom || rightTo - rightFrom >= parentTo - parentFrom) throw new Error("invalid checkpoint split coverage bounds");
   }
   const reached = new Set<string>();
   const visit = (part: Record<string, unknown>, ancestors: Set<string>): void => {

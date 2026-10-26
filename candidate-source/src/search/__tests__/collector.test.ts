@@ -308,6 +308,27 @@ describe("deep collector coverage and resume", () => {
     expect(thirdGet).not.toHaveBeenCalled();
   });
 
+  it("rejects split checkpoints with less than five minutes of child overlap before requests", async () => {
+    const splitPlan = planSearch({ native: {}, limits }, Date.UTC(2026, 0, 2));
+    const split = await collectSearch(splitPlan, { get: injected((path) => {
+      const url = new URL(path, "https://api.hh.ru");
+      const root = url.searchParams.get("date_from") === splitPlan.frozen_date_bounds.date_from && url.searchParams.get("date_to") === splitPlan.frozen_date_bounds.date_to;
+      return root ? page(2501, [], 20) : page(0, []);
+    }).get as never });
+    const children = split.checkpoint.partitions.filter((part) => part.parent_id !== undefined);
+    expect(Date.parse(children[0]!.date_to) - Date.parse(children[1]!.date_from)).toBeGreaterThanOrEqual(5 * 60_000);
+
+    for (const overlapMs of [0, 4 * 60_000]) {
+      const malformed = structuredClone(split.checkpoint);
+      const malformedChildren = malformed.partitions.filter((part) => part.parent_id !== undefined);
+      const rightFrom = Date.parse(malformedChildren[1]!.date_from);
+      malformedChildren[0]!.date_to = new Date(rightFrom + overlapMs).toISOString().replace(/\.\d{3}Z$/, "+0000");
+      const get = vi.fn();
+      await expect(collectSearch(splitPlan, { checkpoint: malformed, get: get as never })).rejects.toThrow(/split|overlap/i);
+      expect(get).not.toHaveBeenCalled();
+    }
+  });
+
   it("rolls back an oversized short continuation page and keeps a resumable capped checkpoint", async () => {
     const largePlan = planSearch({ native: { date_from: "2026-01-01T00:00:00Z", date_to: "2026-01-01T00:05:00Z" }, limits: { ...limits, max_bytes: 64 * 1024 * 1024 } }, Date.UTC(2026, 0, 2));
     const hugeName = "x".repeat(34 * 1024 * 1024);
