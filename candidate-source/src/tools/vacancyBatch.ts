@@ -40,10 +40,15 @@ export async function fetchVacanciesBatch(ids: string[], options: FetchVacancies
   const uniqueIds = [...new Set(parsed.ids)];
   const cap = options.max_response_bytes ?? 64 * 1024;
   if (!Number.isSafeInteger(cap) || cap < 1024 || cap > 128 * 1024) throw new RangeError("max_response_bytes must be between 1024 and 131072");
+  const minimumEnvelope: BatchResult = {
+    items: uniqueIds.map((id) => ({ id, status: "error", error: { code: "response_too_large", status: 999 } })),
+    fetched_at: "2000-01-01T00:00:00.000Z",
+  };
+  if (outputBytes(minimumEnvelope) > cap) throw new RangeError("response cap is too small to represent every requested ID");
   const budget = options.budget ?? createHhRequestBudget({ max_requests: 25, max_duration_sec: 20, max_bytes: 2 * 1024 * 1024 });
   const rows: Array<BatchItem | undefined> = Array(uniqueIds.length).fill(undefined);
   let cursor = 0;
-  let stopped: "forbidden" | "budget" | undefined;
+  let stopped: "forbidden" | "auth" | "budget" | undefined;
 
   const worker = async (): Promise<void> => {
     while (true) {
@@ -51,7 +56,7 @@ export async function fetchVacanciesBatch(ids: string[], options: FetchVacancies
       if (index >= uniqueIds.length) return;
       const id = uniqueIds[index]!;
       if (stopped) {
-        rows[index] = { id, status: "error", error: { code: stopped === "forbidden" ? "stopped_forbidden" : "stopped_budget" } };
+        rows[index] = { id, status: "error", error: { code: stopped === "forbidden" ? "stopped_forbidden" : stopped === "auth" ? "stopped_auth" : "stopped_budget" } };
         continue;
       }
       try {
@@ -86,6 +91,7 @@ export async function fetchVacanciesBatch(ids: string[], options: FetchVacancies
         const safe = safeError(error);
         rows[index] = { id, status: safe.status === 404 ? "not_found" : safe.status === 403 ? "forbidden" : "error", error: safe };
         if (safe.status === 403) stopped = "forbidden";
+        else if (safe.status === 401) stopped = "auth";
         else if (safe.code.includes("budget") || safe.code === "cancelled") stopped = "budget";
       }
     }
@@ -99,6 +105,7 @@ export async function fetchVacanciesBatch(ids: string[], options: FetchVacancies
     const item = items[index]!;
     if (item.status === "ok") items[index] = { id: item.id, status: "error", error: { code: "response_too_large" } };
   }
+  if (outputBytes(result) > cap) throw new RangeError("max_response_bytes cannot represent every batch result row");
   return result;
 }
 

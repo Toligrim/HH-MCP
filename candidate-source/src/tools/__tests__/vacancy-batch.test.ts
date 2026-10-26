@@ -74,4 +74,27 @@ describe("get_vacancies_batch", () => {
     expect(result.items[0]?.error?.code).toBe("id_mismatch");
     expect(JSON.stringify(result)).not.toContain("foreign");
   });
+
+  it("rejects a cap too small to represent all error rows before making requests", async () => {
+    const fetch = vi.fn(async () => jsonResponse({}));
+    vi.stubGlobal("fetch", fetch);
+    const budget = createHhRequestBudget({ max_requests: 0, max_duration_sec: 2, max_bytes: 100_000 });
+    await expect(fetchVacanciesBatch(Array.from({ length: 20 }, (_, index) => String(index + 1)), { max_response_bytes: 1024, budget })).rejects.toThrow(/cap/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("stops dispatching after 401 and marks undispatched IDs with stopped_auth", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      calls.push(String(url));
+      if (String(url).endsWith("/1")) return jsonResponse({ secret: "private upstream body" }, 401);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return jsonResponse({ id: "2" });
+    }));
+    const result = await fetchVacanciesBatch(["1", "2", "3"]);
+    expect(calls).toHaveLength(2);
+    expect(result.items[0]?.error?.status).toBe(401);
+    expect(result.items[2]?.error?.code).toBe("stopped_auth");
+    expect(JSON.stringify(result)).not.toContain("private upstream body");
+  });
 });

@@ -12,6 +12,8 @@ describe("post filters", () => {
     const rule = { rule: "night_shifts", value: false } as const;
     expect(evaluatePostFilters({}, [rule], "strict").rules[0]?.state).toBe("unknown");
     expect(evaluatePostFilters({ schedule: { night_shifts: false } }, [rule], "strict").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ schedule: { night_shifts: false } }, [rule], "strict").rules[0]?.source).toBe("schedule.night_shifts");
+    expect(evaluatePostFilters({ night_shifts: false }, [rule], "strict").rules[0]?.source).toBe("night_shifts");
   });
 
   it("treats silence as unknown, chat-only as a match, and mandatory calls as no_match", () => {
@@ -22,10 +24,23 @@ describe("post filters", () => {
     expect(evaluatePostFilters({ description: "Обязательные входящие звонки клиентам" }, [rule], "strict").rules[0]?.state).toBe("no_match");
     expect(evaluatePostFilters({ description: "Без холодных звонков" }, [rule], "strict").rules[0]?.state).toBe("unknown");
     expect(evaluatePostFilters({ description: "Без холодных звонков, обязательные входящие звонки" }, [rule], "strict").rules[0]?.state).toBe("no_match");
+    expect(evaluatePostFilters({ description: "Работа по телефону; обработка входящих заявок" }, [rule], "strict").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ description: "Звонки не обязательны" }, [rule], "strict").rules[0]?.state).not.toBe("no_match");
+    expect(evaluatePostFilters({ description: "Работа без звонков" }, [rule], "strict").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ description: "Общение только в чате. Иногда нужно звонить клиентам" }, [rule], "strict").rules[0]?.state).toBe("no_match");
+    expect(evaluatePostFilters({ description: "Обязательное знание Python; телефон по согласованию" }, [rule], "strict").rules[0]?.state).toBe("unknown");
   });
 
   it("returns unknown for contradictory work format and handles optional/required/negated technology conservatively", () => {
     expect(evaluatePostFilters({ description: "Удалённо или в гибридном формате" }, [{ rule: "work_format", value: "remote" }], "strict").rules[0]?.state).toBe("unknown");
+    const remote = { rule: "work_format", value: "REMOTE" } as const;
+    expect(evaluatePostFilters({ work_format: [{ id: "REMOTE" }], description: "remote work is not available" }, [remote], "strict").rules[0]?.state).not.toBe("match");
+    expect(evaluatePostFilters({ work_format: [{ id: "REMOTE" }], description: "Mandatory office attendance" }, [remote], "strict").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ description: "Our office is in Moscow" }, [remote], "strict").rules[0]?.state).toBe("unknown");
+    const days = { rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" } as const;
+    expect(evaluatePostFilters({ description: "График работы обсудим" }, [days], "strict").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ description: "Смены обсуждаются индивидуально" }, [days], "strict").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ description: "График работы 5/2" }, [days], "strict").rules[0]?.state).toBe("no_match");
     const rule = { rule: "required_technology", value: "Python" } as const;
     expect(evaluatePostFilters({ key_skills: [{ name: "Python" }] }, [rule], "strict").rules[0]?.state).toBe("unknown");
     expect(evaluatePostFilters({ description: "Обязательное знание Pythonic стиль разработки" }, [rule], "strict").rules[0]?.state).toBe("unknown");
@@ -33,6 +48,10 @@ describe("post filters", () => {
     expect(evaluatePostFilters({ description: "Обязательное знание Python" }, [rule], "strict").rules[0]?.state).toBe("match");
     expect(evaluatePostFilters({ description: "Знание Python не требуется" }, [rule], "strict").rules[0]?.state).toBe("no_match");
     expect(evaluatePostFilters({ description: "Обязательное знание Python, но Python не требуется" }, [rule], "strict").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ description: "Python is not mandatory" }, [rule], "strict").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ description: "Python is not mandatory and Linux is required" }, [rule], "strict").rules[0]?.state).not.toBe("match");
+    expect(evaluatePostFilters({ description: "Python is discussed while excellent communication is required" }, [rule], "strict").rules[0]?.state).not.toBe("match");
+    expect(evaluatePostFilters({ description: "Требуется Windows или Linux" }, [{ rule: "required_technology", value: "Linux" }], "strict").rules[0]?.state).not.toBe("match");
   });
 
   it("applies strict, inclusive and review decision policies", () => {
