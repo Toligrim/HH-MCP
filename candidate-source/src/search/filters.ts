@@ -133,7 +133,7 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
   if (!phoneClauses.length) return chatOnly
     ? { state: "match", confidence: 0.85, source: "description", evidence: excerpt(description) }
     : { state: "unknown", confidence: 0, source: "description", evidence: "No phone call evidence" };
-  const obligation = /обязательн|необходим|постоянн|ежедневн|(?:входящ\w*|исходящ\w*)\s+звон|must\s+call|required\s+call|need\s+to\s+call|phone\s+calls?\s+(?:are\s+)?required|mandatory\s+(?:(?:inbound|outbound)\s+)?calls?|(?:inbound|outbound)\s+calls?\s+(?:are\s+)?mandatory|нужно\s+(?:позвон\w*|звон\w*)|требуется\s+(?:позвон\w*|звон\w*)/i;
+  const obligation = /(?<!не)обязательн|необходим|постоянн|ежедневн|(?:входящ\w*|исходящ\w*)\s+звон|must\s+call|required\s+call|need\s+to\s+call|phone\s+calls?\s+(?:are\s+)?required|mandatory\s+(?:(?:inbound|outbound)\s+)?calls?|(?:inbound|outbound)\s+calls?\s+(?:are\s+)?mandatory|нужно\s+(?:позвон\w*|звон\w*)|требуется\s+(?:позвон\w*|звон\w*)/i;
   const negation = /(?:звон\w*|позвон\w*|calls?|phone\s+calls?).{0,35}(?:не\s+обязател|не\s+треб|not\s+mandatory|not\s+required)|(?:не\s+обязател|не\s+треб|не\s+нужно|not\s+mandatory|not\s+required).{0,35}(?:звон\w*|позвон\w*|calls?|phone\s+calls?)/i;
   const mandatory = phoneClauses.filter((part) => obligation.test(part) && !negation.test(part));
   const explicitNoCalls = phoneClauses.some((part) => /без\s+(?:телефонных\s+)?звон|работа\s+без\s+звон|звон\w*.{0,25}не\s+обязател|звон\w*.{0,25}не\s+треб|не\s+нужно\s+звон|calls?\s+not\s+mandatory|calls?\s+not\s+required/i.test(part) && !/cold|холодн/i.test(part));

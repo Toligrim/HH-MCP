@@ -31,6 +31,14 @@ describe("post filters", () => {
     expect(evaluatePostFilters({ description: "Обязательное знание Python; телефон по согласованию" }, [rule], "strict").rules[0]?.state).toBe("unknown");
   });
 
+  it("does not treat compact Russian call negations as mandatory", () => {
+    const rule = { rule: "no_mandatory_phone_calls" } as const;
+    expect(evaluatePostFilters({ description: "Звонки необязательны" }, [rule], "strict").rules[0]?.state).not.toBe("no_match");
+    expect(evaluatePostFilters({ description: "Необязательные звонки" }, [rule], "strict").rules[0]?.state).not.toBe("no_match");
+    expect(evaluatePostFilters({ description: "Обязательные звонки" }, [rule], "strict").rules[0]?.state).toBe("no_match");
+    expect(evaluatePostFilters({ description: "Работа без звонков" }, [rule], "strict").rules[0]?.state).toBe("match");
+  });
+
   it("returns unknown for contradictory work format and handles optional/required/negated technology conservatively", () => {
     expect(evaluatePostFilters({ description: "Удалённо или в гибридном формате" }, [{ rule: "work_format", value: "remote" }], "strict").rules[0]?.state).toBe("unknown");
     const remote = { rule: "work_format", value: "REMOTE" } as const;
