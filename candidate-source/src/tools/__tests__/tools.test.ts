@@ -175,6 +175,15 @@ describe("search_vacancies", () => {
     expect(url).not.toContain("salary=");
   });
 
+  it("repeats multi-value query keys and reparses direct handler input", async () => {
+    mockHhGet.mockResolvedValueOnce({ items: [], found: 0, pages: 0, per_page: 20, page: 0 });
+    await handleSearchVacancies({ area: [1, "2"] } as never);
+    expect(new URLSearchParams(lastUrl().split("?")[1]).getAll("area")).toEqual(["1", "2"]);
+    await expect(handleSearchVacancies({ mystery: true } as never)).rejects.toThrow(/Unrecognized key/);
+    await expect(handleSearchVacancies({ currency: "USD" } as never)).rejects.toThrow(/currency requires salary/);
+    expect(mockHhGet).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects period together with date_from/date_to", async () => {
     await expect(
       handleSearchVacancies({ period: 7, date_from: "2026-01-01", per_page: 20, page: 0 }),
