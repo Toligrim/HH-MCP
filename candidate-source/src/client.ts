@@ -105,7 +105,14 @@ async function waitForDelay(
   else if (signal?.aborted) throw new HhBudgetError("cancelled");
   const delay = Math.min(Math.max(0, requestedMs), budget ? Math.max(0, budget.deadline - Date.now()) : requestedMs);
   if (delay > 0) {
-    await waitForBudget(new Promise<void>((resolve) => setTimeout(resolve, delay)), budget, signal);
+    let delayTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await waitForBudget(new Promise<void>((resolve) => {
+        delayTimer = setTimeout(resolve, delay);
+      }), budget, signal);
+    } finally {
+      if (delayTimer) clearTimeout(delayTimer);
+    }
   }
   if (budget) assertHhBudgetAvailable(budget, signal);
   else if (signal?.aborted) throw new HhBudgetError("cancelled");

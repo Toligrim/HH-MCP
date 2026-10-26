@@ -113,6 +113,22 @@ describe("HH request budgets", () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
+  it("clears the pending Retry-After timer immediately when cancelled", async () => {
+    const controller = new AbortController();
+    const shared = budget({ deadline: Date.now() + 120 });
+    mockFetch.mockResolvedValueOnce(response(429, "busy", { "Retry-After": "60" }));
+
+    const settled = hhGet("/vacancies", { budget: shared, signal: controller.signal })
+      .then(() => undefined, (error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    setTimeout(() => controller.abort(), 20);
+    await vi.advanceTimersByTimeAsync(20);
+
+    await expect(settled).resolves.toMatchObject({ code: "cancelled" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("stops in the shared rate queue when its deadline expires", async () => {
     mockFetch.mockImplementation(() => Promise.resolve(jsonResponse({ ok: true })));
     const firstFive = Array.from({ length: 5 }, () => hhGet("/areas"));
