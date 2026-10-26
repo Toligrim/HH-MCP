@@ -16,6 +16,44 @@ describe("native vacancy query", () => {
     expect(query.get("raw")).toBeNull();
   });
 
+  it("accepts standard ISO timezone forms and canonicalizes without changing the instant", () => {
+    const normalized = normalizeVacancySearch({
+      date_from: "2026-10-26T00:00:00Z",
+      date_to: "2026-10-26T03:00:00+03:00",
+    });
+    expect(normalized.date_from).toBe("2026-10-26T00:00:00+0000");
+    expect(normalized.date_to).toBe("2026-10-26T03:00:00+0300");
+    const query = buildVacancyQuery({ date_from: "2026-10-26T00:00:00Z" });
+    expect(query.get("date_from")).toBe("2026-10-26T00:00:00+0000");
+    expect(normalizeVacancySearch({ date_from: "2026-10-26T03:00:00+0300" }).date_from).toBe("2026-10-26T03:00:00+0300");
+    expect(normalizeVacancySearch({ date_from: new Date("2026-10-26T00:00:00.000Z").toISOString() }).date_from).toBe("2026-10-26T00:00:00.000+0000");
+  });
+
+  it("requires numeric HH ids and rejects empty text while preserving valid query text", () => {
+    for (const input of [{ area: "garbage_name" }, { professional_role: "role_x" }, { employer_id: "company_x" }, { area: Number.MAX_SAFE_INTEGER + 1 }, { text: "  \t " }, { excluded_text: " \n " }]) {
+      expect(() => normalizeVacancySearch(input), JSON.stringify(input)).toThrow();
+    }
+    expect(buildVacancyQuery({ area: "123", professional_role: 96, employer_id: "456", text: "  Go AND Rust  " }).get("text")).toBe("  Go AND Rust  ");
+    expect(buildVacancyQuery({ metro: "1.2.3", industry: "2.4.6" }).get("metro")).toBe("1.2.3");
+  });
+
+  it("normalizes with_salary aliases without losing labels and rejects contradictory salary flags", () => {
+    const combined = normalizeVacancySearch({ with_salary: true, label: ["night_shifts", "with_salary"] });
+    expect(combined.label).toEqual(["night_shifts", "with_salary"]);
+    const added = normalizeVacancySearch({ with_salary: true, label: "night_shifts" });
+    expect(added.label).toEqual(["night_shifts", "with_salary"]);
+    expect(normalizeVacancySearch({ with_salary: false })).toMatchObject({ only_with_salary: false });
+    for (const input of [
+      { with_salary: false, label: "with_salary" },
+      { with_salary: false, only_with_salary: true },
+      { only_with_salary: false, label: "with_salary" },
+      { with_salary: true, only_with_salary: false },
+    ]) expect(() => normalizeVacancySearch(input), JSON.stringify(input)).toThrow(/salary/i);
+    const explanation = explainVacancyQuery({ with_salary: false });
+    expect(explanation.query_string).toContain("only_with_salary=false");
+    expect(explanation.warnings.join(" ")).toMatch(/not a request to exclude vacancies without salary/i);
+  });
+
   it("serializes documented multi-value filters as repeated query keys", () => {
     const query = buildVacancyQuery({
       area: [1, "2"], professional_role: [96, "97"], search_field: ["name", "description"],
@@ -52,7 +90,7 @@ describe("native vacancy query", () => {
   it("rejects unknown keys and invalid cross-field/geographic/date inputs", () => {
     for (const input of [
       { mystery: "x" }, { area: [] }, { area: ["1", ""] }, { area: "0" }, { page: -1 }, { per_page: 101 },
-      { salary: Number.POSITIVE_INFINITY }, { currency: "USD" }, { date_from: "2026-02-30" },
+      { salary: Number.POSITIVE_INFINITY }, { currency: "USD" }, { date_from: "2026-02-30" }, { date_from: "2026-02-30T00:00:00Z" },
       { date_from: "2026-01-01T10:00:00" }, { date_from: "2026-01-01T10:00:00+2500" }, { period: 366 },
       { top_lat: 55 }, { top_lat: 50, bottom_lat: 55, left_lng: 30, right_lng: 40 },
       { order_by: "distance", sort_point_lat: 55 }, { order_by: "distance", sort_point_lat: 91, sort_point_lng: 30 },

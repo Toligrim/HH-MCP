@@ -184,6 +184,18 @@ describe("search_vacancies", () => {
     expect(mockHhGet).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves salary alias criteria and rejects contradictory/direct empty search filters before HH", async () => {
+    mockHhGet.mockResolvedValueOnce({ items: [], found: 0, pages: 0, per_page: 20, page: 0 });
+    await handleSearchVacancies({ with_salary: true, label: "night_shifts", area: "123", text: "  Go developer  " } as never);
+    const query = new URLSearchParams(lastUrl().split("?")[1]);
+    expect(query.getAll("label")).toEqual(["night_shifts", "with_salary"]);
+    expect(query.get("area")).toBe("123");
+    expect(query.get("text")).toBe("  Go developer  ");
+    await expect(handleSearchVacancies({ with_salary: false, label: "with_salary" } as never)).rejects.toThrow(/conflicting salary filters/);
+    await expect(handleSearchVacancies({ text: " \t " } as never)).rejects.toThrow(/empty or whitespace/);
+    expect(mockHhGet).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects period together with date_from/date_to", async () => {
     await expect(
       handleSearchVacancies({ period: 7, date_from: "2026-01-01", per_page: 20, page: 0 }),

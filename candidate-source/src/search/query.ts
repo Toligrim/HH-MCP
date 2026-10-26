@@ -1,9 +1,9 @@
 import { z } from "zod";
 import { assertKnownDictionaryValue, getSearchCatalogueMetadata } from "./dictionaries.js";
 
-const lexicalId = z.string().max(120).regex(/^[A-Za-z0-9_-]+$/, "must be a positive lexical id").refine((value) => !/^\d+$/.test(value) || BigInt(value) > 0n, "must be a positive id");
-const id = z.union([z.number().int().positive().finite(), lexicalId]);
-const decimalId = z.union([z.number().positive().finite(), z.string().regex(/^\d+(?:\.\d+)*$/, "must be a positive id").refine((value) => Number(value) > 0, "must be a positive id")]);
+const positiveNumericId = z.string().max(120).regex(/^\d+$/, "must be a positive numeric id").refine((value) => BigInt(value) > 0n, "must be a positive numeric id");
+const id = z.union([z.number().int().safe().positive(), positiveNumericId]);
+const decimalId = z.union([z.number().positive().finite(), z.string().max(120).regex(/^\d+(?:\.\d+)*$/, "must be a positive id").refine((value) => value.split(".").some((part) => BigInt(part) > 0n), "must be a positive id")]);
 const numeric = (min: number, max: number) => z.number().finite().min(min).max(max);
 const boundedText = z.string().max(500);
 const dictionaryField = (catalogue: string, multi = false) => {
@@ -18,12 +18,13 @@ const dateValue = z.string().refine((value) => {
     const d = new Date(`${value}T00:00:00Z`);
     return Number.isFinite(d.valueOf()) && d.toISOString().slice(0, 10) === value;
   }
-  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})([+-])(\d{2})(\d{2})$/.exec(value);
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,3})?(Z|([+-])(\d{2}):?(\d{2}))$/.exec(value);
   if (!match) return false;
   const date = new Date(`${match[1]}T00:00:00Z`);
   if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 10) !== match[1]) return false;
-  if (Number(match[2]) > 23 || Number(match[3]) > 59 || Number(match[4]) > 59 || Number(match[6]) > 23 || Number(match[7]) > 59) return false;
-  const normalized = value.replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+  if (Number(match[2]) > 23 || Number(match[3]) > 59 || Number(match[4]) > 59) return false;
+  if (match[6] !== "Z" && (Number(match[8]) > 23 || Number(match[9]) > 59)) return false;
+  const normalized = value.endsWith("Z") ? value : value.replace(/([+-]\d{2}):?(\d{2})$/, "$1:$2");
   return Number.isFinite(Date.parse(normalized));
 }, "must be YYYY-MM-DD or an ISO date-time with timezone");
 const list = <T extends z.ZodTypeAny>(item: T) => z.union([item, z.array(item).min(1).max(100)]);
@@ -33,7 +34,7 @@ const hostSchema = z.enum(["hh.ru", "rabota.by", "hh1.az", "hh.uz", "hh.kz", "he
 export const searchVacanciesSchema = z.object({
   page: z.number().int().min(0).default(0),
   per_page: z.number().int().min(1).max(100).default(20),
-  text: boundedText.optional(),
+  text: boundedText.refine((value) => value.trim().length > 0, "must not be empty or whitespace").optional(),
   search_field: dictionaryField("vacancy_search_fields", true).optional(),
   experience: dictionaryField("experience", true).optional(),
   employment: dictionaryField("employment", true).optional(),
@@ -70,7 +71,7 @@ export const searchVacanciesSchema = z.object({
   work_schedule_by_days: dictionaryField("work_schedule_by_days", true).optional(),
   working_hours: dictionaryField("working_hours", true).optional(),
   work_format: dictionaryField("work_format", true).optional(),
-  excluded_text: boundedText.optional(),
+  excluded_text: boundedText.refine((value) => value.trim().length > 0, "must not be empty or whitespace").optional(),
   education: dictionaryField("education", true).optional(),
   driver_license_types: dictionaryField("driver_license_types", true).optional(),
   host: hostSchema.optional(),
@@ -84,6 +85,9 @@ export type VacancySearchParams = z.infer<typeof searchVacanciesSchema>;
 
 export function normalizeVacancySearch(input: unknown): VacancySearchParams {
   const value = searchVacanciesSchema.parse(input);
+  const normalizeDate = (date: string | undefined) => date?.replace(/Z$/, "+0000").replace(/([+-]\d{2}):(\d{2})$/, "$1$2");
+  value.date_from = normalizeDate(value.date_from);
+  value.date_to = normalizeDate(value.date_to);
   const { top_lat, bottom_lat, left_lng, right_lng } = value;
   const geo = [top_lat, bottom_lat, left_lng, right_lng];
   if (geo.some((v) => v !== undefined) && geo.some((v) => v === undefined)) throw new Error("all four bounding coordinates are required together");
@@ -95,14 +99,16 @@ export function normalizeVacancySearch(input: unknown): VacancySearchParams {
   const point = [value.sort_point_lat, value.sort_point_lng];
   if ((point.some((v) => v !== undefined) && point.some((v) => v === undefined)) || (value.order_by === "distance" && point.some((v) => v === undefined)) || (value.order_by !== "distance" && point.some((v) => v !== undefined))) throw new Error("distance sorting requires both sort points, which are only valid with order_by=distance");
   if ((value.page + 1) * value.per_page > 2000) throw new Error("hh.ru caps pagination depth at 2000 results");
-  if (value.with_salary === true && value.label !== undefined) {
-    const labels = Array.isArray(value.label) ? value.label : [value.label];
-    if (!labels.includes("with_salary")) throw new Error("with_salary alias conflicts with label");
-  }
+  const labels = value.label === undefined ? [] : Array.isArray(value.label) ? value.label : [value.label];
+  const hasSalaryLabel = labels.includes("with_salary");
+  const explicitlyExcludeSalary = value.with_salary === false || value.only_with_salary === false;
+  const explicitlyRequireSalary = value.with_salary === true || value.only_with_salary === true || hasSalaryLabel;
+  if (explicitlyExcludeSalary && explicitlyRequireSalary) throw new Error("conflicting salary filters: with_salary/only_with_salary=false conflicts with only_with_salary=true or label=with_salary");
   if (value.with_salary === true) {
-    const labels = value.label === undefined ? [] : Array.isArray(value.label) ? value.label : [value.label];
-    value.label = labels.length ? value.label : "with_salary";
+    const combined = [...new Set([...labels, "with_salary"])];
+    value.label = labels.length ? combined : "with_salary";
   }
+  if (value.with_salary === false) value.only_with_salary = false;
   delete value.with_salary;
   if (value.salary !== undefined && value.currency === undefined) value.currency = "RUR";
   return value;
@@ -134,6 +140,7 @@ export function explainVacancyQuery(input: unknown): { normalized: VacancySearch
   const warnings: string[] = [];
   if (normalized.employment !== undefined || normalized.schedule !== undefined || normalized.part_time !== undefined || normalized.only_with_salary !== undefined || normalized.premium !== undefined) warnings.push("Some supplied filters are deprecated by HH; modern replacements are preferred.");
   if (hadSalaryAlias) warnings.push("with_salary alias normalized to label=with_salary.");
+  if (source.with_salary === false) warnings.push("with_salary=false normalizes to the neutral only_with_salary=false flag; it is not a request to exclude vacancies without salary.");
   const catalogue = getSearchCatalogueMetadata();
   const refreshState = catalogue.refreshed_catalogues.length
     ? catalogue.refreshed_catalogues.map((item) => `${item.dictionary}=${item.updated_at}${item.stale ? " (stale)" : " (fresh)"}`).join(", ")

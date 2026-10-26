@@ -11,7 +11,7 @@ const seed: Record<string, string[]> = {
   salary_range_mode: ["MONTH", "SHIFT", "HOUR", "FLY_IN_FLY_OUT", "SERVICE"],
   vacancy_label: ["with_address", "accept_handicapped", "not_from_agency", "accept_kids", "accredited_it", "low_performance", "internship", "night_shifts", "with_salary", "accept_teens", "accept_labor_contract", "accept_temporary"],
   vacancy_search_order: ["publication_time", "salary_desc", "salary_asc", "relevance", "distance"],
-  part_time: ["only_saturday_and_sunday", "from_four_to_six_hours_in_a_day", "start_after_sixteen", "full", "part", "project", "volunteer", "probation"],
+  part_time: ["only_saturday_and_sunday", "from_four_to_six_hours_in_a_day", "start_after_sixteen", "part", "project", "accept_temporary"],
   vacancy_search_employment_form: ["FULL", "PART", "PROJECT", "FLY_IN_FLY_OUT"],
   work_schedule_by_days: ["SIX_ON_ONE_OFF", "FIVE_ON_TWO_OFF", "FOUR_ON_FOUR_OFF", "FOUR_ON_THREE_OFF", "FOUR_ON_TWO_OFF", "THREE_ON_THREE_OFF", "THREE_ON_TWO_OFF", "TWO_ON_TWO_OFF", "TWO_ON_ONE_OFF", "ONE_ON_THREE_OFF", "ONE_ON_TWO_OFF", "WEEKEND", "FLEXIBLE", "OTHER"],
   working_hours: ["HOURS_2", "HOURS_3", "HOURS_4", "HOURS_5", "HOURS_6", "HOURS_7", "HOURS_8", "HOURS_9", "HOURS_10", "HOURS_11", "HOURS_12", "HOURS_24", "FLEXIBLE", "OTHER"],
@@ -41,7 +41,7 @@ const endpointMap: Record<string, { path: string; key?: string | string[] }> = {
 };
 
 export const resolveSearchDictionarySchema = z.object({
-  dictionary: z.enum(Object.keys(endpointMap) as [string, ...string[]]),
+  dictionary: z.enum([...Object.keys(endpointMap)] as [string, ...string[]]).or(z.literal("education")),
   text: z.string().trim().min(1).max(120),
 }).strict();
 
@@ -64,11 +64,48 @@ function flatten(value: unknown, out: DictionaryItem[] = []): DictionaryItem[] {
   if (Array.isArray(value)) { for (const item of value) flatten(item, out); return out; }
   if (!value || typeof value !== "object") return out;
   const record = value as Record<string, unknown>;
-  if ((typeof record.id === "string" || typeof record.id === "number") && typeof record.name === "string") {
-    out.push({ ...record, id: String(record.id), name: record.name });
+  const identifier = record.id ?? record.code;
+  if ((typeof identifier === "string" || typeof identifier === "number") && typeof record.name === "string") {
+    out.push({ ...record, id: String(identifier), name: record.name });
   }
   for (const [key, child] of Object.entries(record)) if (key !== "id" && key !== "name" && (Array.isArray(child) || child && typeof child === "object")) flatten(child, out);
   return out;
+}
+
+function compact(items: DictionaryItem[]): DictionaryItem[] {
+  return items.map(({ id, name }) => ({ id, name }));
+}
+
+function extractItems(dictionary: string, response: unknown, keys: string[]): DictionaryItem[] {
+  if (dictionary === "professional_roles") {
+    const root = response && typeof response === "object" ? response as Record<string, unknown> : {};
+    const categories = Array.isArray(root.categories) ? root.categories : [];
+    const roles = categories.flatMap((category) => {
+      if (!category || typeof category !== "object") return [];
+      const children = (category as Record<string, unknown>).roles;
+      return Array.isArray(children) ? children : [];
+    });
+    return compact(flatten(roles));
+  }
+  if (dictionary === "metro") {
+    const root = response && typeof response === "object" ? response as Record<string, unknown> : {};
+    const areas = Array.isArray(root.areas) ? root.areas : [];
+    const lineAndStationNodes = areas.flatMap((area) => {
+      if (!area || typeof area !== "object") return [];
+      const lines = (area as Record<string, unknown>).lines;
+      if (!Array.isArray(lines)) return [];
+      return lines.flatMap((line) => {
+        if (!line || typeof line !== "object") return [];
+        const stations = (line as Record<string, unknown>).stations;
+        return [line, ...(Array.isArray(stations) ? stations : [])];
+      });
+    });
+    return compact(flatten(lineAndStationNodes));
+  }
+  if (keys.length && response && typeof response === "object") {
+    return compact(keys.flatMap((key) => flatten((response as Record<string, unknown>)[key])));
+  }
+  return compact(flatten(response));
 }
 
 function upsert(key: string, entry: Entry): void {
@@ -82,34 +119,58 @@ function upsert(key: string, entry: Entry): void {
   }
   if (key === "part_time") {
     const vals = entry.items.map((item) => item.id);
-    catalogueIds.set("part_time", new Set([...vals, "full", "part", "project", "volunteer", "probation"]));
+    catalogueIds.set("part_time", new Set([...vals, "part", "project", "accept_temporary"]));
   }
 }
 
 export async function resolveSearchDictionary(input: { dictionary: string; text: string }, options?: { now?: number }): Promise<unknown> {
   const { dictionary, text } = resolveSearchDictionarySchema.parse(input);
   const now = options?.now ?? Date.now();
-  let entry = cache.get(dictionary);
-  if (!entry || now - entry.loaded_at >= TTL_MS) {
+  let entry = dictionary === "education"
+    ? {
+      items: [
+        { id: "not_required_or_not_specified", name: "Not required or not specified" },
+        { id: "special_secondary", name: "Special secondary" },
+        { id: "higher", name: "Higher" },
+      ],
+      updated_at: Date.UTC(2026, 9, 26), loaded_at: now,
+    }
+    : cache.get(dictionary);
+  if (dictionary !== "education" && (!entry || now - entry.loaded_at >= TTL_MS)) {
     const endpoint = endpointMap[dictionary]!;
     const response = await hhGet(endpoint.path);
     const keys = endpoint.key === undefined ? [] : Array.isArray(endpoint.key) ? endpoint.key : [endpoint.key];
-    const selected = keys.length && response && typeof response === "object"
-      ? keys.flatMap((key) => flatten((response as Record<string, unknown>)[key]))
-      : flatten(response);
+    let selected = extractItems(dictionary, response, keys);
+    if (dictionary === "part_time") {
+      const root = response && typeof response === "object" ? response as Record<string, unknown> : {};
+      const values = keys.flatMap((key) => {
+        const sourceValues = flatten(root[key]);
+        return key === "employment" ? sourceValues.filter((item) => item.id === "part" || item.id === "project") : sourceValues;
+      });
+      const byId = new Map(compact(values).map((item) => [item.id, item]));
+      selected = [...byId.values()];
+    }
     const items = selected.slice(0, 50_000);
+    if (items.length === 0) {
+      return {
+        dictionary, status: "unknown", candidates: [], catalogue_available: false,
+        catalogue_error: "HH returned no usable values for this dictionary; existing seeded and refreshed validation values were preserved.",
+      };
+    }
     entry = { items, updated_at: now, loaded_at: now };
     upsert(dictionary, entry);
-  } else {
+  } else if (dictionary !== "education") {
     cache.delete(dictionary);
-    cache.set(dictionary, entry);
+    if (entry) cache.set(dictionary, entry);
   }
+  if (!entry) throw new Error("dictionary catalogue unavailable");
   const needle = text.toLocaleLowerCase();
   const exact = entry.items.find((item) => item.id.toLocaleLowerCase() === needle || item.name.toLocaleLowerCase() === needle);
   const candidates = exact ? [] : entry.items.filter((item) => item.id.toLocaleLowerCase().includes(needle) || item.name.toLocaleLowerCase().includes(needle)).slice(0, 20);
   return {
     dictionary, status: exact ? "exact" : candidates.length ? "candidates" : "unknown",
     ...(exact ? { id: exact.id, name: exact.name } : {}), candidates,
+    catalogue_available: true,
     catalogue_updated_at: new Date(entry.updated_at).toISOString(), stale: now - entry.loaded_at >= TTL_MS,
     note: "IDs are returned only from the public HH catalogue; opaque IDs in other filters are validated by HH.",
   };
