@@ -168,6 +168,35 @@ describe("HH request budgets", () => {
     expect(cancelled).toBe(true);
   });
 
+  it("prevents another fetch after a shared budget has overflowed", async () => {
+    const shared = budget({ maxBytes: 3 });
+    mockFetch
+      .mockResolvedValueOnce(new Response("too many bytes", { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    const first = hhGet("/vacancies", { budget: shared }).then(() => undefined, (error: unknown) => error);
+    await vi.runAllTimersAsync();
+    await expect(first).resolves.toMatchObject({ code: "byte_budget" });
+
+    const second = hhGet("/vacancies", { budget: shared }).then(() => undefined, (error: unknown) => error);
+    await vi.runAllTimersAsync();
+
+    await expect(second).resolves.toMatchObject({ code: "byte_budget" });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a response whose byte count exactly reaches the shared limit", async () => {
+    const shared = budget({ maxBytes: 2 });
+    mockFetch.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+
+    const pending = hhGet("/vacancies", { budget: shared });
+    await vi.runAllTimersAsync();
+
+    await expect(pending).resolves.toEqual({});
+    expect(shared.bytes).toBe(2);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the request deadline active while the response body is streaming", async () => {
     const shared = budget({ deadline: Date.now() + 100 });
     const body = new ReadableStream<Uint8Array>({

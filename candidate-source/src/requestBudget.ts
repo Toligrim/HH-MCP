@@ -58,6 +58,7 @@ export function assertHhBudgetAvailable(
 ): void {
   if (signal?.aborted) throw new HhBudgetError("cancelled");
   if (Date.now() >= budget.deadline) throw new HhBudgetError("duration_budget");
+  if (budget.bytes > budget.maxBytes) throw new HhBudgetError("byte_budget");
 }
 
 export function recordHhRequestAttempt(
