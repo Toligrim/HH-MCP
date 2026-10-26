@@ -12,7 +12,7 @@ Fresh read-only local production check: backend/proxy/tunnel active, health ok w
 1. Keep product changes under candidate-source/ on a new feature branch: minimal diff, ops history intact, no directory relocation.
 2. Promote product to repository root: cleaner eventual product layout, but disruptive and requires the owner's explicit restructuring choice.
 3. Separate upstream fork: good long-term separation, requires a separate repository decision and migration.
-Coordinator choice for this reversible implementation: option 1, feature feat/issue-1-search-engine in a linked worktree. The owner's source-location answer can supersede it before any tree migration. Original ops/source checkouts and default branch are unchanged.
+Coordinator choice for this reversible implementation: option 1, feature feat/issue-1-search-engine in a linked worktree. Owner confirmed option1 (branch in Toligrim/HH-MCP, structure preserved). Original ops/source checkouts and default branch are unchanged.
 
 ## Components and files
 - src/requestBudget.ts + client.ts: attempt-counted request/byte/deadline budgets, cancellation through rate waits/retries/body consumption; existing limiter remains the common in-process gateway.
@@ -29,7 +29,7 @@ Quick search preserves compact and raw formats. New search inputs reject unknown
 Deep MCP calls are synchronous/read-only, do not create files or background jobs, enforce max 20 seconds / 25 HTTP attempts / 500 unique items / 2 MiB received / 64 KiB response and return at most 20 compact items.
 Local CLI supports explicit persistence with default 500 attempts / 20,000 items / 600 seconds / 64 MiB received; hard caps 1,000 attempts / 50,000 items / 1,800 seconds / 128 MiB. One local job at a time, process-local shared limiter; multi-process/distributed collection unsupported.
 No safe split means PARTIAL with unsplittable_over_cap. Completed means only all reachable planned partitions completed; mutable live index always warned, never historical/global completeness.
-Postfilters always fetch details within budget; missing fields are unknown. Rules: night_shifts, work_format, schedule/day pattern, required technology, no mandatory calls. HTML is untrusted source data, raw preserved and text separately cleaned.
+Postfilters always fetch details within budget; details:none suppresses retention, not necessary evidence reads. Checkpoints persist active_elapsed_ms and restore only remaining duration; serialized state is capped at32MiB with PARTIAL state_budget before overflow; missing fields are unknown. Rules: night_shifts, work_format, schedule/day pattern, required technology, no mandatory calls. HTML is untrusted source data, raw preserved and text separately cleaned.
 No exports, signed downloads, server job store, remote checkpoint/cursor IDs, employer/resume feature expansion, service/network/config changes or GitHub Actions. Capabilities explicitly report unavailable features and external-proxy auth.
 
 ## Verification
