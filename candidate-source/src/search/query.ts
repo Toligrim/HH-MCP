@@ -3,7 +3,14 @@ import { assertKnownDictionaryValue, getSearchCatalogueMetadata } from "./dictio
 
 const positiveNumericId = z.string().max(120).regex(/^\d+$/, "must be a positive numeric id").refine((value) => BigInt(value) > 0n, "must be a positive numeric id");
 const id = z.union([z.number().int().safe().positive(), positiveNumericId]);
-const decimalId = z.union([z.number().positive().finite(), z.string().max(120).regex(/^\d+(?:\.\d+)*$/, "must be a positive id").refine((value) => value.split(".").some((part) => BigInt(part) > 0n), "must be a positive id")]);
+const isPositiveDecimalId = (value: string) => /^\d+(?:\.\d+)*$/.test(value) && value.split(".").some((part) => BigInt(part) > 0n);
+const decimalId = z.union([
+  z.number().positive().finite().refine((value) => {
+    const wireValue = String(value);
+    return wireValue.length <= 120 && isPositiveDecimalId(wireValue) && (!Number.isInteger(value) || Number.isSafeInteger(value));
+  }, "must serialize as a positive decimal id"),
+  z.string().max(120).regex(/^\d+(?:\.\d+)*$/, "must be a positive id").refine(isPositiveDecimalId, "must be a positive id"),
+]);
 const numeric = (min: number, max: number) => z.number().finite().min(min).max(max);
 const boundedText = z.string().max(500);
 const dictionaryField = (catalogue: string, multi = false) => {

@@ -37,6 +37,16 @@ describe("native vacancy query", () => {
     expect(buildVacancyQuery({ metro: "1.2.3", industry: "2.4.6" }).get("metro")).toBe("1.2.3");
   });
 
+  it("keeps decimal metro and industry IDs in HH wire syntax", () => {
+    for (const value of [1e-7, 1e21, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => normalizeVacancySearch({ metro: value }), String(value)).toThrow();
+      expect(() => normalizeVacancySearch({ industry: value }), String(value)).toThrow();
+    }
+    expect(buildVacancyQuery({ metro: "1.5", industry: "1.5" }).get("metro")).toBe("1.5");
+    expect(buildVacancyQuery({ metro: 1.5, industry: 1.5 }).get("industry")).toBe("1.5");
+    expect(buildVacancyQuery({ area: 123 }).get("area")).toBe("123");
+  });
+
   it("normalizes with_salary aliases without losing labels and rejects contradictory salary flags", () => {
     const combined = normalizeVacancySearch({ with_salary: true, label: ["night_shifts", "with_salary"] });
     expect(combined.label).toEqual(["night_shifts", "with_salary"]);
