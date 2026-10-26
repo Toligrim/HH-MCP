@@ -262,12 +262,73 @@ describe("deep collector coverage and resume", () => {
     expect(request.searchParams.get("date_from")).not.toBe(multi.frozen_date_bounds.date_from);
   });
 
+  it("executes branch period against frozen current even when base bounds are historical", async () => {
+    const multi = planSearch({ native: { area: 1, date_from: "2020-01-01", date_to: "2020-01-31" }, branches: [{ name: "recent", native: { period: 7 } }], limits }, Date.UTC(2026, 0, 8));
+    const { get } = injected(() => page(0, []));
+    await collectSearch(multi, { get: get as never });
+    const request = new URL(get.mock.calls[0]![0], "https://api.hh.ru");
+    expect(request.searchParams.get("date_from")).toBe("2026-01-01T00:00:00+0000");
+    expect(request.searchParams.get("date_to")).toBe("2026-01-08T00:00:00+0000");
+    expect(request.searchParams.get("area")).toBe("1");
+  });
+
   it("allows a PARTIAL checkpoint with pending branches to resume", async () => {
     const multi = planSearch({ native: {}, branches: [{ name: "one", native: { text: "one" } }, { name: "two", native: { text: "two" } }], limits }, Date.UTC(2026, 0, 2));
     const first = await collectSearch(multi, { get: injected(() => { throw new HhAccessError({ status: 403, kind: "unknown", statusText: "forbidden" }); }).get as never });
     expect(first.status).toBe("PARTIAL");
     const resumed = await collectSearch(multi, { checkpoint: first.checkpoint, get: injected(() => page(0, [])).get as never });
     expect(resumed.checkpoint.partitions.every((part) => part.status !== "pending")).toBe(true);
+  });
+
+  it("rejects a missing execution root before issuing requests", async () => {
+    const multi = planSearch({ native: {}, branches: [{ name: "one", native: { text: "one" } }, { name: "two", native: { text: "two" } }], limits }, Date.UTC(2026, 0, 2));
+    const first = await collectSearch(multi, { get: injected(() => page(0, [])).get as never });
+    const missing = structuredClone(first.checkpoint);
+    missing.partitions = [];
+    const get = vi.fn();
+    await expect(collectSearch(multi, { checkpoint: missing, get: get as never })).rejects.toThrow(/partition|queue|root/i);
+    expect(get).not.toHaveBeenCalled();
+
+    const missingBranch = structuredClone(first.checkpoint);
+    missingBranch.partitions.splice(0, 1);
+    const secondGet = vi.fn();
+    await expect(collectSearch(multi, { checkpoint: missingBranch, get: secondGet as never })).rejects.toThrow(/partition|queue|root/i);
+    expect(secondGet).not.toHaveBeenCalled();
+
+    const splitPlan = planSearch({ native: {}, limits }, Date.UTC(2026, 0, 2));
+    const split = await collectSearch(splitPlan, { get: injected((path) => {
+      const url = new URL(path, "https://api.hh.ru");
+      const root = url.searchParams.get("date_from") === splitPlan.frozen_date_bounds.date_from && url.searchParams.get("date_to") === splitPlan.frozen_date_bounds.date_to;
+      return root ? page(2501, [], 20) : page(0, []);
+    }).get as never });
+    const missingChild = structuredClone(split.checkpoint);
+    missingChild.partitions.splice(missingChild.partitions.findIndex((part) => part.parent_id !== undefined), 1);
+    const thirdGet = vi.fn();
+    await expect(collectSearch(splitPlan, { checkpoint: missingChild, get: thirdGet as never })).rejects.toThrow(/split|partition|queue/i);
+    expect(thirdGet).not.toHaveBeenCalled();
+  });
+
+  it("rolls back an oversized short continuation page and keeps a resumable capped checkpoint", async () => {
+    const largePlan = planSearch({ native: { date_from: "2026-01-01T00:00:00Z", date_to: "2026-01-01T00:05:00Z" }, limits: { ...limits, max_bytes: 64 * 1024 * 1024 } }, Date.UTC(2026, 0, 2));
+    const hugeName = "x".repeat(34 * 1024 * 1024);
+    const largeGet = injected((path) => {
+      const pageNo = Number(new URL(path, "https://api.hh.ru").searchParams.get("page") ?? 0);
+      return pageNo === 0 ? page(200, Array.from({ length: 100 }, (_, i) => String(4000 + i)), 2) : { found: 200, pages: 2, items: [{ id: "9000", name: hugeName }] };
+    });
+    const result = await collectSearch(largePlan, { get: largeGet.get as never });
+    expect(result.status).toBe("PARTIAL");
+    expect(result.checkpoint.partitions[0]).toMatchObject({ status: "pending", page: 1, first_page_done: true });
+    expect(result.items).toHaveLength(100);
+    expect(result.checkpoint.counters.bytes).toBeGreaterThan(34 * 1024 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(result.checkpoint), "utf8")).toBeLessThan(32 * 1024 * 1024);
+    expect(result.manifest.gaps.some((gap) => gap.code === "state_budget")).toBe(true);
+
+    const resumedGet = injected(() => page(200, Array.from({ length: 100 }, (_, i) => String(5000 + i)), 2));
+    const resumed = await collectSearch(largePlan, { checkpoint: result.checkpoint, get: resumedGet.get as never });
+    expect(resumedGet.get).toHaveBeenCalledTimes(1);
+    expect(resumed.checkpoint.counters.requests).toBe(result.checkpoint.counters.requests + 1);
+    expect(resumed.checkpoint.counters.bytes).toBeGreaterThan(result.checkpoint.counters.bytes);
+    expect(resumed.items).toHaveLength(200);
   });
 
   it("uses real hhGet with mocked fetch and charges attempts to max_requests exactly once", async () => {

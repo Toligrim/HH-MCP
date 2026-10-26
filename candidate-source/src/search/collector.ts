@@ -82,7 +82,7 @@ function validateCheckpoint(value: unknown, plan: SearchPlan): CollectorCheckpoi
     return Number.isFinite(parsed) ? parsed : undefined;
   };
   for (const part of value.partitions) {
-    if (!own(part) || typeof part.id !== "string" || !part.id || partitionIds.has(part.id) || typeof part.branch !== "string" || !branches.has(part.branch) || typeof part.query !== "string" || !allowed.has(String(part.status)) || !Number.isSafeInteger(part.page) || Number(part.page) < 0 || Number(part.page) > PAGE_CAP || typeof part.first_page_done !== "boolean" || !Array.isArray(part.found_history) || part.found_history.some((x) => !Number.isSafeInteger(x) || Number(x) < 0) || part.found !== undefined && (!Number.isSafeInteger(part.found) || Number(part.found) < 0) || part.pages !== undefined && (!Number.isSafeInteger(part.pages) || Number(part.pages) < 0)) throw new Error("invalid checkpoint partition shape");
+    if (!own(part) || typeof part.id !== "string" || !/^[1-9]\d*(?:\.[1-9]\d*)*$/.test(part.id) || partitionIds.has(part.id) || typeof part.branch !== "string" || !branches.has(part.branch) || typeof part.query !== "string" || !allowed.has(String(part.status)) || !Number.isSafeInteger(part.page) || Number(part.page) < 0 || Number(part.page) > PAGE_CAP || typeof part.first_page_done !== "boolean" || !Array.isArray(part.found_history) || part.found_history.some((x) => !Number.isSafeInteger(x) || Number(x) < 0) || part.found !== undefined && (!Number.isSafeInteger(part.found) || Number(part.found) < 0) || part.pages !== undefined && (!Number.isSafeInteger(part.pages) || Number(part.pages) < 0)) throw new Error("invalid checkpoint partition shape");
     partitionIds.add(part.id);
     const from = dateMs(part.date_from);
     const to = dateMs(part.date_to);
@@ -100,7 +100,41 @@ function validateCheckpoint(value: unknown, plan: SearchPlan): CollectorCheckpoi
       if (!parent || parent.branch !== part.branch || dateMs(part.date_from)! < dateMs(parent.date_from)! || dateMs(part.date_to)! > dateMs(parent.date_to)!) throw new Error("invalid checkpoint partition parent bounds");
     }
   }
-  const partitionById = new Map((value.partitions as Array<Record<string, unknown>>).map((part) => [part.id as string, part]));
+  const partitions = value.partitions as Array<Record<string, unknown>>;
+  const partitionById = new Map(partitions.map((part) => [part.id as string, part]));
+  if (partitions.length < plan.branches.length) throw new Error("invalid checkpoint execution queue: missing branch root");
+  const roots = partitions.filter((part) => part.parent_id === undefined);
+  if (roots.length !== plan.branches.length) throw new Error("invalid checkpoint execution queue roots");
+  for (const branch of plan.branches) {
+    const branchRoots = roots.filter((root) => root.branch === branch.name);
+    if (branchRoots.length !== 1) throw new Error("invalid checkpoint execution queue branch root");
+    const root = branchRoots[0]!;
+    if (dateMs(root.date_from) !== dateMs(branch.native.date_from ?? plan.frozen_date_bounds.date_from) || dateMs(root.date_to) !== dateMs(branch.native.date_to ?? plan.frozen_date_bounds.date_to)) throw new Error("invalid checkpoint branch root bounds");
+  }
+  for (const parent of partitions) {
+    const children = partitions.filter((child) => child.parent_id === parent.id);
+    if (children.length === 0) continue;
+    if (children.length !== 2 || parent.status !== "done" || children.some((child) => child.branch !== parent.branch)) throw new Error("invalid checkpoint split children");
+    const [left, right] = [...children].sort((a, b) => dateMs(a.date_from)! - dateMs(b.date_from)!);
+    const parentFrom = dateMs(parent.date_from)!;
+    const parentTo = dateMs(parent.date_to)!;
+    const leftFrom = dateMs(left!.date_from)!;
+    const leftTo = dateMs(left!.date_to)!;
+    const rightFrom = dateMs(right!.date_from)!;
+    const rightTo = dateMs(right!.date_to)!;
+    if (leftFrom !== parentFrom || rightTo !== parentTo || leftTo < rightFrom || leftFrom >= leftTo || rightFrom >= rightTo || leftTo - leftFrom >= parentTo - parentFrom || rightTo - rightFrom >= parentTo - parentFrom) throw new Error("invalid checkpoint split coverage bounds");
+  }
+  const reached = new Set<string>();
+  const visit = (part: Record<string, unknown>, ancestors: Set<string>): void => {
+    const id = part.id as string;
+    if (ancestors.has(id)) throw new Error("invalid checkpoint partition cycle");
+    if (reached.has(id)) return;
+    reached.add(id);
+    const nextAncestors = new Set(ancestors).add(id);
+    for (const child of partitions.filter((candidate) => candidate.parent_id === id)) visit(child, nextAncestors);
+  };
+  for (const root of roots) visit(root, new Set());
+  if (reached.size !== partitions.length || partitions.some((part) => part.parent_id !== undefined && !partitionById.has(part.parent_id as string))) throw new Error("invalid checkpoint execution queue graph");
   for (const item of value.items) {
     if (!own(item) || canonicalId(item.id) !== item.id || !own(item.raw_search) || !Array.isArray(item.provenance) || item.provenance.length === 0 || dateMs(item.first_fetched_at) === undefined || dateMs(item.last_fetched_at) === undefined || item.detail_checked !== undefined && typeof item.detail_checked !== "boolean" || item.raw_detail !== undefined && !own(item.raw_detail)) throw new Error("invalid checkpoint item shape");
     for (const provenance of item.provenance) {
@@ -181,17 +215,23 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
     for (let pageNo = part.page; pageNo < advertised; pageNo++) {
       if (cp.items.length >= plan.limits.max_items) { part.status = "partial"; cp.gaps.push({ code: "item_budget", branch: part.branch, partition_id: part.id }); return; }
       const pageItemsSnapshot = structuredClone(cp.items);
+      const pageGapsSnapshot = structuredClone(cp.gaps);
+      const previousFound = part.found;
+      const previousFoundHistory = structuredClone(part.found_history);
+      const previousPages = part.pages;
       cp.counters.logical_pages++;
       const row = parsePage(await request(queryFor(part, pageNo, branch, plan.mode === "fast")));
       if (part.found !== row.found) { part.found_history.push(row.found); cp.gaps.push({ code: "found_changed", branch: part.branch, partition_id: part.id }); }
       part.found = row.found;
       if (row.pages !== undefined && part.pages !== undefined && row.pages !== part.pages) { part.status = "partial"; cp.gaps.push({ code: "pages_changed", branch: part.branch, partition_id: part.id }); return; }
       addHits(part, row.items);
-      const expected = Math.min(pageSize, Math.max(0, row.found - pageNo * pageSize));
-      if (row.items.length < expected) { part.page = pageNo + 1; part.status = "partial"; cp.gaps.push({ code: "short_page", branch: part.branch, partition_id: part.id }); await persist(); return; }
       if (safeJsonBytes(cp) > CHECKPOINT_LIMIT) {
         cp.items = pageItemsSnapshot;
+        cp.gaps = pageGapsSnapshot;
         cp.counters.items = cp.items.length;
+        part.found = previousFound;
+        part.found_history = previousFoundHistory;
+        part.pages = previousPages;
         part.status = "pending";
         part.page = pageNo;
         stateBudget = true;
@@ -199,6 +239,8 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
         await persist();
         return;
       }
+      const expected = Math.min(pageSize, Math.max(0, row.found - pageNo * pageSize));
+      if (row.items.length < expected) { part.page = pageNo + 1; part.status = "partial"; cp.gaps.push({ code: "short_page", branch: part.branch, partition_id: part.id }); await persist(); return; }
       part.page = pageNo + 1;
       await persist();
     }

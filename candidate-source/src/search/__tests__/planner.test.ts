@@ -43,6 +43,18 @@ describe("search planning", () => {
     expect(Date.parse(plan.branches[0]!.native.date_to!) - Date.parse(plan.branches[0]!.native.date_from!)).toBeLessThanOrEqual(7 * 86_400_000 + 300_000);
   });
 
+  it("lets a branch period replace inherited historical date bounds while retaining other filters", () => {
+    const limits = { max_requests: 10, max_items: 20, max_duration_sec: 30, max_bytes: 100_000, max_detail_fetches: 0 };
+    const plan = planSearch({ native: { area: 1, date_from: "2020-01-01", date_to: "2020-01-31", text: "engineer" }, branches: [{ name: "recent", native: { period: 7 } }], limits }, Date.UTC(2026, 0, 8));
+    const branch = plan.branches[0]!;
+    expect(branch.native.date_from).toBe("2026-01-01T00:00:00+0000");
+    expect(branch.native.date_to).toBe("2026-01-08T00:00:00+0000");
+    expect(branch.native.area).toEqual(["1"]);
+    expect(branch.native.text).toBe("engineer");
+    expect(plan.warnings).toContain("Branch recent overrides base field date_from.");
+    expect(plan.warnings).toContain("Branch recent overrides base field date_to.");
+  });
+
   it("validates branch partial overrides against inherited cross-field constraints", () => {
     const limits = { max_requests: 10, max_items: 20, max_duration_sec: 30, max_bytes: 100_000, max_detail_fetches: 0 };
     const salary = planSearch({ native: { salary: 100 }, branches: [{ name: "rubles", native: { currency: "RUR" } }], limits }, Date.UTC(2026, 0, 8));

@@ -107,9 +107,9 @@ export function planSearch(input: unknown, now = Date.now()): SearchPlan {
     let branchFrom: number;
     let branchTo: number;
     if (native.period !== undefined) {
-      branchTo = native.date_to ? dayTo(String(normalizedMerged.date_to)) : to;
+      // A branch period is a logical window override, ending at the frozen current time.
+      branchTo = current;
       branchFrom = branchTo - native.period * 86_400_000;
-      if (!native.date_to) branchFrom = current - native.period * 86_400_000;
     } else {
       branchFrom = normalizedMerged.date_from ? dateMillis(String(normalizedMerged.date_from)) : from;
       branchTo = normalizedMerged.date_to ? dayTo(String(normalizedMerged.date_to)) : to;
