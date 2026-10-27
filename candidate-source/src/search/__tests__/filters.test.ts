@@ -161,8 +161,11 @@ describe("post filters", () => {
     }
     const structuredRule = { rule: "work_schedule_by_days", value: "SIX_ON_ONE_OFF" } as const;
     const result = evaluatePostFilters({ work_schedule_by_days: [{ id: "SIX_ON_ONE_OFF" }], description: "Schedule 16/1." }, [structuredRule], "review").rules[0];
-    expect(result?.state).toBe("match");
-    expect(result?.source).toBe("work_schedule_by_days");
+    expect(result?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_schedule_by_days: [{ id: "SIX_ON_ONE_OFF" }], description: "График 6/10." }, [structuredRule], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_schedule_by_days: [{ id: "SIX_ON_ONE_OFF" }], description: "Schedule 6/1." }, [structuredRule], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ description: "Schedule 16/1." }, [structuredRule], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_schedule_by_days: [{ id: "SIX_ON_ONE_OFF" }], description: "The report lists a ratio of 16/1." }, [structuredRule], "review").rules[0]?.state).toBe("match");
   });
 
   it("keeps denied work formats unknown in structured and description-only evidence", () => {

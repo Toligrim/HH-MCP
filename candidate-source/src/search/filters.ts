@@ -55,6 +55,10 @@ const scheduleLabels: Record<string, string> = {
   TWO_ON_ONE_OFF: "2/1", ONE_ON_THREE_OFF: "1/3", ONE_ON_TWO_OFF: "1/2",
   WEEKEND: "По выходным", FLEXIBLE: "Свободный", OTHER: "Другое",
 };
+const supportedNumericScheduleLabels = new Set([...scheduleIds].flatMap((id) => {
+  const label = scheduleLabels[id];
+  return label && /^\d\/\d$/.test(label) ? [label] : [];
+}));
 const scheduleLabelIds = new Map(Object.entries(scheduleLabels).map(([id, label]) => [label.toLocaleLowerCase("ru"), id]));
 function canonicalSchedule(value: string): string | undefined {
   if (scheduleIds.has(value)) return value;
@@ -79,6 +83,20 @@ function schedulesInDescription(value: string): string[] {
     const pattern = schedulePattern(id);
     return pattern ? new RegExp(pattern, "iu").test(part) : false;
   }));
+}
+
+function hasUnsupportedNumericSchedule(value: string): boolean {
+  const scheduleContext = /\b(?:work\s+)?schedule\b|график[а-яё]*|расписани[а-яё]*|режим(?:\s+работы)?/iu;
+  return clauses(value).some((part) => {
+    for (const match of part.matchAll(/(?<!\d)(\d+)\s*([/-])\s*(\d+)(?!\d)/gu)) {
+      const normalized = `${match[1]}/${match[3]}`;
+      if (supportedNumericScheduleLabels.has(normalized)) continue;
+      const index = match.index ?? 0;
+      const context = part.slice(Math.max(0, index - 32), Math.min(part.length, index + match[0].length + 32));
+      if (scheduleContext.test(context)) return true;
+    }
+    return false;
+  });
 }
 
 function formatKind(value: string): "remote" | "hybrid" | "office" | "field" | undefined {
@@ -209,7 +227,7 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
         }
         actual.push(entry.id);
       }
-      const descriptionConflict = clauses(description).some((part) => {
+      const descriptionConflict = hasUnsupportedNumericSchedule(description) || clauses(description).some((part) => {
         const described = [...scheduleIds].filter((id) => {
           const pattern = schedulePattern(id);
           return pattern ? new RegExp(pattern, "iu").test(part) : false;
