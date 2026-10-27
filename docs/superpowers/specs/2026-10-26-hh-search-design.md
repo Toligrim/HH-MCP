@@ -34,4 +34,3 @@ No exports, signed downloads, server job store, remote checkpoint/cursor IDs, em
 
 ## Verification
 Test each behavior before implementing (RED/GREEN evidence), run focused checks during iteration, whole suite before each task commit. Each task gets a separate read-only Luna 6 spec+quality review. Coordinator runs fresh required npm checks, a bounded public HH smoke and final whole-branch review. No merge without “Мержи”; deployment is a separate workflow.
-
