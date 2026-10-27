@@ -46,7 +46,7 @@ function rawMcpRequest(endpoint: string, options: {
   protocolVersion?: string;
   body?: unknown;
   onChunk?: (chunk: string) => void;
-} = {}): Promise<{ status: number; body: string }> {
+} = {}): Promise<{ status: number; body: string; sessionId?: string }> {
   const target = new URL(endpoint);
   const headers: Record<string, string> = {};
   if (options.method !== "DELETE") {
@@ -72,7 +72,11 @@ function rawMcpRequest(endpoint: string, options: {
         chunks.push(chunk);
         options.onChunk?.(chunk.toString("utf8"));
       });
-      response.on("end", () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+      response.on("end", () => resolve({
+        status: response.statusCode ?? 0,
+        body: Buffer.concat(chunks).toString("utf8"),
+        ...(typeof response.headers["mcp-session-id"] === "string" ? { sessionId: response.headers["mcp-session-id"] } : {}),
+      }));
     });
     request.once("error", reject);
     if (body !== undefined) request.write(body);
@@ -180,6 +184,117 @@ describe("HTTP MCP input limits", () => {
       native: { text: `find ${"{[".repeat(40)}` },
     } });
     expect(quotedDelimiters.isError).not.toBe(true);
+  });
+
+  it("cancels numeric request ID zero and keeps it distinct from string zero", async () => {
+    fixtureCalls.length = 0;
+    const endpoint = `${baseUrl}/mcp`;
+    const protocolVersion = "2025-03-26";
+    const pendingResponses: Array<Promise<{ status: number; body: string; sessionId?: string }>> = [];
+    const initializeSession = async (name: string): Promise<string> => {
+      const initialized = await rawMcpRequest(endpoint, {
+        protocolVersion,
+        body: {
+          jsonrpc: "2.0",
+          id: "init",
+          method: "initialize",
+          params: { protocolVersion, capabilities: {}, clientInfo: { name, version: "1" } },
+        },
+      });
+      expect(initialized.status).toBe(200);
+      expect(initialized.sessionId).toMatch(/^[0-9a-f-]{36}$/i);
+      return initialized.sessionId!;
+    };
+    const deepSearch = {
+      jsonrpc: "2.0",
+      id: 0,
+      method: "tools/call",
+      params: { name: "deep_search", arguments: { native: { text: "go" }, limits: { max_requests: 1, max_items: 5 } } },
+    };
+    try {
+      const cancellationSession = await initializeSession("zero-cancel-client");
+      const cancelledCall = rawMcpRequest(endpoint, { sessionId: cancellationSession, protocolVersion, body: deepSearch });
+      pendingResponses.push(cancelledCall);
+      await vi.waitFor(() => expect(fixtureCalls.length).toBe(1));
+      const cancellation = await rawMcpRequest(endpoint, {
+        sessionId: cancellationSession,
+        protocolVersion,
+        body: { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 0, reason: "numeric zero regression" } },
+      });
+      expect(cancellation.status).toBe(202);
+      await vi.waitFor(() => expect(fixtureCalls[0]?.aborted).toBe(true));
+      await cancelledCall;
+
+      const retry = rawMcpRequest(endpoint, { sessionId: cancellationSession, protocolVersion, body: { ...deepSearch, id: 1 } });
+      pendingResponses.push(retry);
+      await vi.waitFor(() => expect(fixtureCalls.length).toBe(2));
+      fixtureCalls[1]!.release();
+      const retryResult = await retry;
+      expect(retryResult.body).toContain('"id":1');
+
+      fixtureCalls.length = 0;
+      const responseSession = await initializeSession("zero-response-client");
+      const rejectedProtocolRequest = await rawMcpRequest(endpoint, {
+        sessionId: responseSession,
+        protocolVersion: "unsupported-zero-test-version",
+        body: { jsonrpc: "2.0", id: 0, method: "tools/list" },
+      });
+      expect(rejectedProtocolRequest.status).toBe(400);
+      // Reuse ID 0 only after the rejected HTTP response to prove its pre-dispatch routing entry was released.
+      const successfulZero = rawMcpRequest(endpoint, { sessionId: responseSession, protocolVersion, body: deepSearch });
+      pendingResponses.push(successfulZero);
+      await vi.waitFor(() => expect(fixtureCalls.length).toBe(1));
+      fixtureCalls[0]!.release();
+      const zeroResult = await successfulZero;
+      expect(zeroResult.status).toBe(200);
+      expect(zeroResult.body).toContain('"id":0');
+
+      const errorSession = await initializeSession("zero-error-client");
+      const zeroProtocolError = await rawMcpRequest(endpoint, {
+        sessionId: errorSession,
+        protocolVersion,
+        body: { jsonrpc: "2.0", id: 0, method: "missing/method", params: {} },
+      });
+      expect(zeroProtocolError.status).toBe(200);
+      expect(zeroProtocolError.body).toContain('"id":0');
+      expect(zeroProtocolError.body).toContain('"code":-32601');
+
+      fixtureCalls.length = 0;
+      const typeDistinctSession = await initializeSession("zero-type-distinction-client");
+      const numericZero = rawMcpRequest(endpoint, {
+        sessionId: typeDistinctSession,
+        protocolVersion,
+        body: { jsonrpc: "2.0", id: 0, method: "tools/call", params: { name: "get_vacancies_batch", arguments: { ids: ["123"] } } },
+      });
+      const stringZero = rawMcpRequest(endpoint, {
+        sessionId: typeDistinctSession,
+        protocolVersion,
+        body: { jsonrpc: "2.0", id: "0", method: "tools/call", params: { name: "get_vacancies_batch", arguments: { ids: ["124"] } } },
+      });
+      pendingResponses.push(numericZero, stringZero);
+      await vi.waitFor(() => expect(fixtureCalls.length).toBe(2));
+      const numericFixture = fixtureCalls.find((call) => call.path.startsWith("/vacancies/123"));
+      const stringFixture = fixtureCalls.find((call) => call.path.startsWith("/vacancies/124"));
+      expect(numericFixture).toBeDefined();
+      expect(stringFixture).toBeDefined();
+      const zeroCancellation = await rawMcpRequest(endpoint, {
+        sessionId: typeDistinctSession,
+        protocolVersion,
+        body: { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 0, reason: "keep string zero active" } },
+      });
+      expect(zeroCancellation.status).toBe(202);
+      await vi.waitFor(() => expect(numericFixture?.aborted).toBe(true));
+      expect(stringFixture?.aborted).toBe(false);
+      stringFixture!.release();
+      const [numericResponse, stringResponse] = await Promise.all([numericZero, stringZero]);
+      expect(numericResponse.status).toBe(200);
+      expect(numericResponse.body).not.toContain('"id":0');
+      expect(stringResponse.body).toContain('"id":"0"');
+      expect(stringFixture?.aborted).toBe(false);
+    } finally {
+      fixtureCalls.forEach((call) => call.release());
+      await Promise.allSettled(pendingResponses);
+    }
   });
 
   it("forwards SDK HTTP cancellation to the active deep search and releases its busy slot", async () => {
@@ -358,7 +473,7 @@ describe("HTTP MCP input limits", () => {
     const batchResponse = rawMcpRequest(`${baseUrl}/mcp`, {
       sessionId: activeClient.transport.sessionId,
       body: [
-        { jsonrpc: "2.0", id: 211, method: "tools/call", params: { name: "get_vacancies_batch", arguments: { ids: ["123"] } } },
+        { jsonrpc: "2.0", id: 0, method: "tools/call", params: { name: "get_vacancies_batch", arguments: { ids: ["123"] } } },
         { jsonrpc: "2.0", id: 212, method: "tools/call", params: { name: "get_vacancies_batch", arguments: { ids: ["124"] } } },
       ],
     });
@@ -370,7 +485,7 @@ describe("HTTP MCP input limits", () => {
       expect(siblingFixtureCall).toBeDefined();
       const cancellation = await rawMcpRequest(`${baseUrl}/mcp`, {
         sessionId: activeClient.transport.sessionId,
-        body: { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 211, reason: "cancel active batch member" } },
+        body: { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 0, reason: "cancel active batch member" } },
       });
       expect(cancellation.status).toBe(202);
       await vi.waitFor(() => expect(cancelledFixtureCall?.aborted).toBe(true));
@@ -378,7 +493,7 @@ describe("HTTP MCP input limits", () => {
       siblingFixtureCall!.release();
       const response = await batchResponse;
       expect(response.status).toBe(200);
-      expect(response.body).toContain('"id":211');
+      expect(response.body).toContain('"id":0');
       expect(response.body).toContain('"id":212');
       expect(response.body).toContain("Request cancelled.");
     } finally {

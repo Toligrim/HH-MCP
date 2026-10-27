@@ -6,6 +6,7 @@ import { type ZodRawShape, type ZodObject } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   CancelledNotificationSchema,
   ErrorCode,
@@ -13,6 +14,7 @@ import {
   isJSONRPCNotification,
   isJSONRPCResultResponse,
   JSONRPCRequestSchema,
+  type JSONRPCMessage,
 } from "@modelcontextprotocol/sdk/types.js";
 import { VERSION } from "./version.js";
 import {
@@ -823,6 +825,7 @@ type HttpMcpSession = {
   controlRequests: number;
   requestGroups: Set<HttpMcpRequestGroup>;
   requestGroupsById: Map<string | number, HttpMcpRequestGroup>;
+  internalRequestIdToWireId: Map<string, string | number>;
   reservationHeld: boolean;
   closed: boolean;
   idleTimer?: NodeJS.Timeout;
@@ -831,6 +834,7 @@ type HttpMcpSession = {
 type HttpMcpRequestGroup = {
   response: http.ServerResponse;
   requestIds: Set<string | number>;
+  internalRequestIdsByWireId: Map<string | number, string>;
   cancelledIds: Set<string | number>;
   completedIds: Set<string | number>;
   cancellationResponsesSent: Set<string | number>;
@@ -870,6 +874,64 @@ function validatedCancellationRequestId(message: unknown): string | number | und
   if (!parsed.success) return undefined;
   const requestId = parsed.data.params.requestId;
   return typeof requestId === "string" || typeof requestId === "number" ? requestId : undefined;
+}
+
+function createSessionSdkTransport(session: HttpMcpSession): Transport {
+  const transport = session.transport;
+  // The SDK's cancellation handler treats numeric 0 as absent; translate it only inside this session.
+  const internalMessageToSdk = (message: JSONRPCMessage): JSONRPCMessage => {
+    const request = JSONRPCRequestSchema.safeParse(message);
+    if (request.success) {
+      const internalId = session.requestGroupsById.get(request.data.id)?.internalRequestIdsByWireId.get(request.data.id);
+      return internalId === undefined ? message : { ...message, id: internalId } as JSONRPCMessage;
+    }
+    const requestId = validatedCancellationRequestId(message);
+    if (requestId === undefined) return message;
+    const group = session.requestGroupsById.get(requestId);
+    const internalId = group?.internalRequestIdsByWireId.get(requestId);
+    if (!group || internalId === undefined || group.completedIds.has(requestId) || group.cancelledIds.has(requestId)) return message;
+    const notification = message as Record<string, unknown>;
+    const params = notification.params as Record<string, unknown>;
+    return { ...notification, params: { ...params, requestId: internalId } } as unknown as JSONRPCMessage;
+  };
+  const internalIdToWireId = (id: string | number | undefined): string | number | undefined =>
+    typeof id === "string" ? session.internalRequestIdToWireId.get(id) : undefined;
+  const messageToWire = (message: JSONRPCMessage): JSONRPCMessage => {
+    if (isJSONRPCErrorResponse(message) || isJSONRPCResultResponse(message)) {
+      const wireId = internalIdToWireId(message.id);
+      return wireId === undefined ? message : { ...message, id: wireId } as JSONRPCMessage;
+    }
+    const record = message as Record<string, unknown>;
+    const params = record.params;
+    if (!params || typeof params !== "object" || Array.isArray(params)) return message;
+    const relatedRequestId = (params as Record<string, unknown>).relatedRequestId;
+    const wireId = internalIdToWireId(typeof relatedRequestId === "string" ? relatedRequestId : undefined);
+    return wireId === undefined
+      ? message
+      : { ...record, params: { ...(params as Record<string, unknown>), relatedRequestId: wireId } } as unknown as JSONRPCMessage;
+  };
+  const optionsToWire = (options?: TransportSendOptions): TransportSendOptions | undefined => {
+    if (typeof options?.relatedRequestId !== "string") return options;
+    const wireId = internalIdToWireId(options.relatedRequestId);
+    return wireId === undefined ? options : { ...options, relatedRequestId: wireId };
+  };
+
+  const sdkTransport: Transport = {
+    get sessionId() { return transport.sessionId; },
+    async start() {
+      transport.onmessage = (message, extra) => sdkTransport.onmessage?.(internalMessageToSdk(message), extra);
+      transport.onerror = (error) => sdkTransport.onerror?.(error);
+      transport.onclose = () => sdkTransport.onclose?.();
+      await transport.start();
+    },
+    send(message, options) {
+      return transport.send(messageToWire(message), optionsToWire(options));
+    },
+    close() {
+      return transport.close();
+    },
+  };
+  return sdkTransport;
 }
 
 function isCancellationOnlyPayload(body: unknown): boolean {
@@ -969,6 +1031,7 @@ export function createHttpServer(options: HttpMcpServerOptions = {}): http.Serve
       controlRequests: 0,
       requestGroups: new Set(),
       requestGroupsById: new Map(),
+      internalRequestIdToWireId: new Map(),
       reservationHeld: true,
       closed: false,
     };
@@ -981,6 +1044,8 @@ export function createHttpServer(options: HttpMcpServerOptions = {}): http.Serve
     session.requestGroups.delete(group);
     for (const requestId of group.requestIds) {
       if (session.requestGroupsById.get(requestId) === group) session.requestGroupsById.delete(requestId);
+      const internalId = group.internalRequestIdsByWireId.get(requestId);
+      if (internalId !== undefined) session.internalRequestIdToWireId.delete(internalId);
     }
   };
 
@@ -1060,6 +1125,7 @@ export function createHttpServer(options: HttpMcpServerOptions = {}): http.Serve
         ? {
             response: res,
             requestIds: new Set(requestIds),
+            internalRequestIdsByWireId: new Map(),
             cancelledIds: new Set(),
             completedIds: new Set(),
             cancellationResponsesSent: new Set(),
@@ -1067,14 +1133,19 @@ export function createHttpServer(options: HttpMcpServerOptions = {}): http.Serve
           }
         : undefined;
       if (requestGroup) {
+        for (const requestId of requestGroup.requestIds) {
+          if (requestId !== 0) continue;
+          // Keep the HTTP wire ID for transport routing and expose a truthy SDK-only alias.
+          const internalId = `mcp-http-zero-${randomUUID()}`;
+          requestGroup.internalRequestIdsByWireId.set(requestId, internalId);
+          session.internalRequestIdToWireId.set(internalId, requestId);
+        }
         session.requestGroups.add(requestGroup);
         for (const requestId of requestGroup.requestIds) session.requestGroupsById.set(requestId, requestGroup);
       }
       res.once("close", () => {
         if (res.writableFinished) {
-          if (requestGroup && [...requestGroup.requestIds].every((id) => requestGroup.completedIds.has(id) || requestGroup.cancellationResponsesSent.has(id))) {
-            removeRequestGroup(session, requestGroup);
-          }
+          if (requestGroup) removeRequestGroup(session, requestGroup);
           return;
         }
         if (requestGroup) {
@@ -1090,9 +1161,7 @@ export function createHttpServer(options: HttpMcpServerOptions = {}): http.Serve
         }
       });
       await session.transport.handleRequest(req, res, payload);
-      if (requestGroup && res.writableFinished && [...requestGroup.requestIds].every((id) => requestGroup.completedIds.has(id) || requestGroup.cancellationResponsesSent.has(id))) {
-        removeRequestGroup(session, requestGroup);
-      }
+      if (requestGroup && res.writableFinished) removeRequestGroup(session, requestGroup);
     } finally {
       if (countedAsActive) session.activeRequests = Math.max(0, session.activeRequests - 1);
       if (reservedControlSlot) session.controlRequests = Math.max(0, session.controlRequests - 1);
@@ -1229,7 +1298,7 @@ export function createHttpServer(options: HttpMcpServerOptions = {}): http.Serve
         pendingSessionInitializations++;
         const newSession = createStatefulSession();
         try {
-          await newSession.server.connect(newSession.transport);
+          await newSession.server.connect(createSessionSdkTransport(newSession));
           installCancellationStreamCleanup(newSession);
           await handleSessionRequest(newSession, req, res, body);
         } finally {
