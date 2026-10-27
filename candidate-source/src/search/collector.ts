@@ -6,7 +6,7 @@ import { SearchPlan, SearchBranch, verifySearchPlan } from "./planner.js";
 type PartitionStatus = "pending" | "running" | "done" | "failed" | "partial";
 export type CollectorProvenance = { branch: string; partition_id: string; fetched_at: string };
 export type CollectorItem = { id: string; raw_search: Record<string, unknown>; raw_detail?: Record<string, unknown>; detail_checked?: boolean; provenance: CollectorProvenance[]; first_fetched_at: string; last_fetched_at: string; filtering?: { state: "verified" | "unknown"; decision: "keep" | "exclude" | "review"; rules: ReturnType<typeof evaluatePostFilters>["rules"] } };
-type Partition = { id: string; branch: string; parent_id?: string; query: string; date_from: string; date_to: string; status: PartitionStatus; page: number; found?: number; found_history: number[]; pages?: number; first_page_done: boolean; error?: { code: string; status?: number } };
+type Partition = { id: string; branch: string; parent_id?: string; query: string; date_from: string; date_to: string; status: PartitionStatus; page: number; found?: number; found_history: number[]; pages?: number; first_page_done: boolean; observed_items?: number; duplicate_items?: number; invalid_items?: number; coverage_invalid?: boolean; error?: { code: string; status?: number } };
 type Counters = { requests: number; retries: number; bytes: number; logical_pages: number; items: number; detail_fetches: number; active_elapsed_ms: number };
 export type CollectorCheckpoint = {
   version: "hh-search-checkpoint-v1"; signature: string; plan: SearchPlan; partitions: Partition[]; items: CollectorItem[];
@@ -47,6 +47,14 @@ function canonicalId(raw: unknown): string | undefined {
   if (!/^\d{1,20}$/.test(text) || !/[1-9]/.test(text)) return undefined;
   return BigInt(text).toString();
 }
+function addPartitionGap(cp: CollectorCheckpoint, part: Partition, code: string, detail?: string): void {
+  const existing = cp.gaps.find((gap) => gap.code === code && gap.partition_id === part.id);
+  if (existing) {
+    if (detail !== undefined) existing.detail = detail;
+    return;
+  }
+  cp.gaps.push({ code, branch: part.branch, partition_id: part.id, ...(detail === undefined ? {} : { detail }) });
+}
 function parsePage(value: unknown): { found: number; pages?: number; items: Record<string, unknown>[] } {
   if (!own(value) || !Array.isArray(value.items) || !Number.isSafeInteger(value.found) || Number(value.found) < 0) throw new Error("malformed_search_response");
   const items = value.items.filter(own);
@@ -66,7 +74,7 @@ function queryFor(partition: Partition, page: number, branch: SearchBranch, fast
   return `/vacancies?${params.toString()}`;
 }
 function initialPartitions(plan: SearchPlan): Partition[] {
-  return plan.branches.map((branch, i) => ({ id: `${i + 1}`, branch: branch.name, query: branch.query, date_from: branch.native.date_from ?? plan.frozen_date_bounds.date_from, date_to: branch.native.date_to ?? plan.frozen_date_bounds.date_to, status: "pending", page: 0, found_history: [], first_page_done: false }));
+  return plan.branches.map((branch, i) => ({ id: `${i + 1}`, branch: branch.name, query: branch.query, date_from: branch.native.date_from ?? plan.frozen_date_bounds.date_from, date_to: branch.native.date_to ?? plan.frozen_date_bounds.date_to, status: "pending", page: 0, found_history: [], first_page_done: false, observed_items: 0, duplicate_items: 0, invalid_items: 0 }));
 }
 function validateCheckpoint(value: unknown, plan: SearchPlan): CollectorCheckpoint {
   if (!own(value) || value.version !== "hh-search-checkpoint-v1" || value.signature !== plan.signature || !Array.isArray(value.partitions) || !Array.isArray(value.items) || !Array.isArray(value.gaps) || !own(value.counters) || !own(value.plan)) throw new Error("invalid checkpoint version, shape, or signature");
@@ -86,7 +94,11 @@ function validateCheckpoint(value: unknown, plan: SearchPlan): CollectorCheckpoi
     return Number.isFinite(parsed) ? parsed : undefined;
   };
   for (const part of value.partitions) {
-    if (!own(part) || typeof part.id !== "string" || !/^[1-9]\d*(?:\.[1-9]\d*)*$/.test(part.id) || partitionIds.has(part.id) || typeof part.branch !== "string" || !branches.has(part.branch) || typeof part.query !== "string" || !allowed.has(String(part.status)) || !Number.isSafeInteger(part.page) || Number(part.page) < 0 || Number(part.page) > PAGE_CAP || typeof part.first_page_done !== "boolean" || !Array.isArray(part.found_history) || part.found_history.some((x) => !Number.isSafeInteger(x) || Number(x) < 0) || part.found !== undefined && (!Number.isSafeInteger(part.found) || Number(part.found) < 0) || part.pages !== undefined && (!Number.isSafeInteger(part.pages) || Number(part.pages) < 0)) throw new Error("invalid checkpoint partition shape");
+    if (!own(part)) throw new Error("invalid checkpoint partition shape");
+    const coverageValues = [part.observed_items, part.duplicate_items, part.invalid_items];
+    const coveragePresent = coverageValues.filter((entry) => entry !== undefined).length;
+    if (typeof part.id !== "string" || !/^[1-9]\d*(?:\.[1-9]\d*)*$/.test(part.id) || partitionIds.has(part.id) || typeof part.branch !== "string" || !branches.has(part.branch) || typeof part.query !== "string" || !allowed.has(String(part.status)) || !Number.isSafeInteger(part.page) || Number(part.page) < 0 || Number(part.page) > PAGE_CAP || typeof part.first_page_done !== "boolean" || !Array.isArray(part.found_history) || part.found_history.length > PAGE_CAP || part.found_history.some((x) => !Number.isSafeInteger(x) || Number(x) < 0) || part.found !== undefined && (!Number.isSafeInteger(part.found) || Number(part.found) < 0) || part.pages !== undefined && (!Number.isSafeInteger(part.pages) || Number(part.pages) < 0) || coveragePresent !== 0 && coveragePresent !== coverageValues.length || coverageValues.some((entry) => entry !== undefined && (!Number.isSafeInteger(entry) || Number(entry) < 0)) || typeof part.coverage_invalid !== "undefined" && typeof part.coverage_invalid !== "boolean") throw new Error("invalid checkpoint partition shape");
+    if (coveragePresent === coverageValues.length && Number(part.duplicate_items) + Number(part.invalid_items) > Number(part.observed_items)) throw new Error("invalid checkpoint partition coverage counters");
     partitionIds.add(part.id);
     const from = dateMs(part.date_from);
     const to = dateMs(part.date_to);
@@ -139,8 +151,11 @@ function validateCheckpoint(value: unknown, plan: SearchPlan): CollectorCheckpoi
   };
   for (const root of roots) visit(root, new Set());
   if (reached.size !== partitions.length || partitions.some((part) => part.parent_id !== undefined && !partitionById.has(part.parent_id as string))) throw new Error("invalid checkpoint execution queue graph");
+  const itemIds = new Set<string>();
   for (const item of value.items) {
     if (!own(item) || canonicalId(item.id) !== item.id || !own(item.raw_search) || !Array.isArray(item.provenance) || item.provenance.length === 0 || dateMs(item.first_fetched_at) === undefined || dateMs(item.last_fetched_at) === undefined || item.detail_checked !== undefined && typeof item.detail_checked !== "boolean" || item.raw_detail !== undefined && !own(item.raw_detail)) throw new Error("invalid checkpoint item shape");
+    if (itemIds.has(item.id as string)) throw new Error("duplicate global checkpoint item ID");
+    itemIds.add(item.id as string);
     for (const provenance of item.provenance) {
       if (!own(provenance) || typeof provenance.branch !== "string" || !branches.has(provenance.branch) || typeof provenance.partition_id !== "string" || dateMs(provenance.fetched_at) === undefined) throw new Error("invalid checkpoint item provenance");
       const source = partitionById.get(provenance.partition_id);
@@ -158,6 +173,24 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
   const cp: CollectorCheckpoint = options.checkpoint
     ? validateCheckpoint(options.checkpoint, plan)
     : { version: "hh-search-checkpoint-v1", signature: plan.signature, plan: structuredClone(plan), partitions: initialPartitions(plan), items: [], counters: { requests: 0, retries: 0, bytes: 0, logical_pages: 0, items: 0, detail_fetches: 0, active_elapsed_ms: 0 }, gaps: [], started_at: new Date().toISOString(), updated_at: new Date().toISOString(), interrupted_http_unknown: false, status: "RUNNING" };
+  const itemsById = new Map(cp.items.map((item) => [item.id, item]));
+  const partitionItems = new Map(cp.partitions.map((part) => [part.id, new Set<string>()]));
+  for (const item of cp.items) {
+    for (const provenance of item.provenance) partitionItems.get(provenance.partition_id)?.add(item.id);
+  }
+  for (const part of cp.partitions) {
+    const ids = partitionItems.get(part.id)!;
+    if (part.observed_items === undefined || part.duplicate_items === undefined || part.invalid_items === undefined) {
+      // v1 checkpoints predate these bounded counters. Provenance still proves
+      // the unique IDs already retained, so continue from that lower bound.
+      part.observed_items = ids.size;
+      part.duplicate_items = 0;
+      part.invalid_items = 0;
+    } else if (part.observed_items - part.duplicate_items - part.invalid_items !== ids.size) {
+      part.coverage_invalid = true;
+    }
+    if (part.coverage_invalid) addPartitionGap(cp, part, "coverage_state_invalid", "Persisted per-partition coverage counters disagree with item provenance.");
+  }
   if (cp.partitions.some((p) => p.status === "running") || cp.running_detail_id) {
     cp.interrupted_http_unknown = true;
     for (const part of cp.partitions) if (part.status === "running") part.status = "pending";
@@ -188,6 +221,64 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
   let fatalStop = false;
   let stateBudget = false;
 
+  type PageUndo = {
+    itemsLength: number;
+    gapsLength: number;
+    itemCount: number;
+    logicalPages: number;
+    addedItemIds: Set<string>;
+    addedPartitionIds: string[];
+      changedItems: Map<string, { item: CollectorItem; lastFetchedAt: string; provenanceLength: number }>;
+    part: { query: string; page: number; found?: number; foundHistoryLength: number; pages?: number; firstPageDone: boolean; observedItems: number; duplicateItems: number; invalidItems: number; coverageInvalid?: boolean; error?: Partition["error"] };
+  };
+  const beginPage = (part: Partition): PageUndo => ({
+    itemsLength: cp.items.length,
+    gapsLength: cp.gaps.length,
+    itemCount: cp.counters.items,
+    logicalPages: cp.counters.logical_pages,
+    addedItemIds: new Set(),
+    addedPartitionIds: [],
+    changedItems: new Map(),
+    part: {
+      query: part.query,
+      page: part.page,
+      found: part.found,
+      foundHistoryLength: part.found_history.length,
+      pages: part.pages,
+      firstPageDone: part.first_page_done,
+      observedItems: part.observed_items ?? 0,
+      duplicateItems: part.duplicate_items ?? 0,
+      invalidItems: part.invalid_items ?? 0,
+      coverageInvalid: part.coverage_invalid,
+      error: part.error ? { ...part.error } : undefined,
+    },
+  });
+  const rollbackPage = (part: Partition, undo: PageUndo): void => {
+    for (const state of undo.changedItems.values()) {
+      state.item.last_fetched_at = state.lastFetchedAt;
+      state.item.provenance.length = state.provenanceLength;
+    }
+    cp.items.length = undo.itemsLength;
+    for (const id of undo.addedItemIds) itemsById.delete(id);
+    const ids = partitionItems.get(part.id)!;
+    for (const id of undo.addedPartitionIds) ids.delete(id);
+    cp.gaps.length = undo.gapsLength;
+    cp.counters.items = undo.itemCount;
+    cp.counters.logical_pages = undo.logicalPages;
+    part.query = undo.part.query;
+    part.page = undo.part.page;
+    part.found = undo.part.found;
+    part.found_history.length = undo.part.foundHistoryLength;
+    part.pages = undo.part.pages;
+    part.first_page_done = undo.part.firstPageDone;
+    part.status = "pending";
+    part.observed_items = undo.part.observedItems;
+    part.duplicate_items = undo.part.duplicateItems;
+    part.invalid_items = undo.part.invalidItems;
+    part.coverage_invalid = undo.part.coverageInvalid;
+    part.error = undo.part.error ? { ...undo.part.error } : undefined;
+  };
+
   const persist = async (): Promise<void> => {
     cp.updated_at = new Date().toISOString();
     cp.counters.active_elapsed_ms = Math.max(cp.counters.active_elapsed_ms, Date.now() - clockStart + (options.checkpoint ? (options.checkpoint as CollectorCheckpoint).counters.active_elapsed_ms : 0));
@@ -206,22 +297,88 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
       catch (error) { throw new CheckpointPersistenceError(error); }
     }
   };
-  const addHits = (part: Partition, rows: Record<string, unknown>[]): void => {
+  const addHits = (part: Partition, rows: Record<string, unknown>[], undo: PageUndo): void => {
     const fetchedAt = new Date().toISOString();
+    const partitionIds = partitionItems.get(part.id)!;
     for (const row of rows) {
+      part.observed_items = (part.observed_items ?? 0) + 1;
       const id = canonicalId(row.id);
-      if (!id) { cp.gaps.push({ code: "invalid_vacancy_id", branch: part.branch, partition_id: part.id }); continue; }
-      const existing = cp.items.find((item) => item.id === id);
+      if (!id) { part.invalid_items = (part.invalid_items ?? 0) + 1; continue; }
+      const isDuplicateInPartition = partitionIds.has(id);
+      if (isDuplicateInPartition) part.duplicate_items = (part.duplicate_items ?? 0) + 1;
+      else {
+        partitionIds.add(id);
+        undo.addedPartitionIds.push(id);
+      }
+      const existing = itemsById.get(id);
       const provenance = { branch: part.branch, partition_id: part.id, fetched_at: fetchedAt };
       if (existing) {
+        if (!undo.addedItemIds.has(id) && !undo.changedItems.has(id)) {
+          undo.changedItems.set(id, { item: existing, lastFetchedAt: existing.last_fetched_at, provenanceLength: existing.provenance.length });
+        }
         existing.last_fetched_at = fetchedAt;
-        if (!existing.provenance.some((p) => p.branch === part.branch && p.partition_id === part.id)) existing.provenance.push(provenance);
+        if (!isDuplicateInPartition && !existing.provenance.some((p) => p.branch === part.branch && p.partition_id === part.id)) existing.provenance.push(provenance);
       } else {
-        if (cp.items.length >= plan.limits.max_items) { cp.gaps.push({ code: "item_budget", branch: part.branch, partition_id: part.id }); continue; }
-        cp.items.push({ id, raw_search: row, provenance: [provenance], first_fetched_at: fetchedAt, last_fetched_at: fetchedAt });
+        if (cp.items.length >= plan.limits.max_items) { addPartitionGap(cp, part, "item_budget"); continue; }
+        const item: CollectorItem = { id, raw_search: row, provenance: [provenance], first_fetched_at: fetchedAt, last_fetched_at: fetchedAt };
+        cp.items.push(item);
+        itemsById.set(id, item);
+        undo.addedItemIds.add(id);
       }
     }
     cp.counters.items = cp.items.length;
+  };
+  const reconcileCoverage = (): void => {
+    const childrenByParent = new Map<string, Partition[]>();
+    for (const part of cp.partitions) {
+      if (part.parent_id === undefined) continue;
+      const children = childrenByParent.get(part.parent_id) ?? [];
+      children.push(part);
+      childrenByParent.set(part.parent_id, children);
+    }
+    const internalPartitionIds = new Set(childrenByParent.keys());
+    // v1 wrote invalid-ID gaps for the overloaded parent's probe page. Its
+    // descendant leaves now provide the actual coverage evidence.
+    cp.gaps = cp.gaps.filter((gap) => !(gap.code === "invalid_vacancy_id" && gap.partition_id && internalPartitionIds.has(gap.partition_id)));
+    const leavesUnder = (part: Partition): Partition[] => {
+      const children = childrenByParent.get(part.id) ?? [];
+      return children.length === 0 ? [part] : children.flatMap(leavesUnder);
+    };
+
+    for (const part of cp.partitions) {
+      const leafIds = partitionItems.get(part.id)!;
+      if (part.observed_items! - part.duplicate_items! - part.invalid_items! !== leafIds.size) part.coverage_invalid = true;
+      if (part.coverage_invalid) addPartitionGap(cp, part, "coverage_state_invalid", "Persisted per-partition coverage counters disagree with item provenance.");
+      const isLeaf = (childrenByParent.get(part.id)?.length ?? 0) === 0;
+      if (!isLeaf) continue;
+
+      if ((part.duplicate_items ?? 0) > 0) {
+        addPartitionGap(cp, part, "duplicate_vacancy_id", `duplicate_rows=${part.duplicate_items}`);
+      }
+      if ((part.invalid_items ?? 0) > 0) {
+        addPartitionGap(cp, part, "invalid_vacancy_id", `invalid_rows=${part.invalid_items}`);
+      }
+      if (part.found_history.length > 1 && new Set(part.found_history).size > 1 || part.found !== undefined && part.found_history.at(-1) !== part.found) {
+        addPartitionGap(cp, part, "found_changed");
+      }
+      if (part.status === "done" && part.found !== undefined) {
+        const unique = leafIds.size;
+        if (unique !== part.found) {
+          addPartitionGap(cp, part, "coverage_mismatch", `expected=${part.found};unique=${unique}`);
+        }
+      }
+    }
+
+    for (const part of cp.partitions) {
+      if (!(childrenByParent.get(part.id)?.length)) continue;
+      const leaves = leavesUnder(part);
+      if (!leaves.length || leaves.some((leaf) => leaf.status !== "done") || part.found === undefined) continue;
+      const leafUnion = new Set<string>();
+      for (const leaf of leaves) for (const id of partitionItems.get(leaf.id)!) leafUnion.add(id);
+      if (leafUnion.size !== part.found) {
+        addPartitionGap(cp, part, "coverage_mismatch", `expected=${part.found};unique_leaf_union=${leafUnion.size}`);
+      }
+    }
   };
   const request = async (path: string): Promise<unknown> => get(path, { budget, signal: options.signal } as HhGetOptions);
   const paginate = async (part: Partition, branch: SearchBranch): Promise<void> => {
@@ -229,34 +386,25 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
     const maxPages = plan.mode === "fast" ? 1 : PAGE_CAP;
     const advertised = Math.min(maxPages, Math.max(1, part.pages ?? Math.ceil((part.found ?? 0) / pageSize)));
     for (let pageNo = part.page; pageNo < advertised; pageNo++) {
-      if (cp.items.length >= plan.limits.max_items) { part.status = "partial"; cp.gaps.push({ code: "item_budget", branch: part.branch, partition_id: part.id }); return; }
-      const pageItemsSnapshot = structuredClone(cp.items);
-      const pageGapsSnapshot = structuredClone(cp.gaps);
-      const previousFound = part.found;
-      const previousFoundHistory = structuredClone(part.found_history);
-      const previousPages = part.pages;
+      if (cp.items.length >= plan.limits.max_items) { part.status = "partial"; addPartitionGap(cp, part, "item_budget"); return; }
+      const undo = beginPage(part);
       cp.counters.logical_pages++;
       const row = parsePage(await request(queryFor(part, pageNo, branch, plan.mode === "fast")));
-      if (part.found !== row.found) { part.found_history.push(row.found); cp.gaps.push({ code: "found_changed", branch: part.branch, partition_id: part.id }); }
+      if (part.found !== row.found) addPartitionGap(cp, part, "found_changed");
+      part.found_history.push(row.found);
       part.found = row.found;
-      if (row.pages !== undefined && part.pages !== undefined && row.pages !== part.pages) { part.status = "partial"; cp.gaps.push({ code: "pages_changed", branch: part.branch, partition_id: part.id }); return; }
-      addHits(part, row.items);
+      if (row.pages !== undefined && part.pages !== undefined && row.pages !== part.pages) { part.status = "partial"; addPartitionGap(cp, part, "pages_changed"); return; }
+      addHits(part, row.items, undo);
       if (safeJsonBytes(cp) > CHECKPOINT_LIMIT) {
-        cp.items = pageItemsSnapshot;
-        cp.gaps = pageGapsSnapshot;
-        cp.counters.items = cp.items.length;
-        part.found = previousFound;
-        part.found_history = previousFoundHistory;
-        part.pages = previousPages;
-        part.status = "pending";
-        part.page = pageNo;
+        rollbackPage(part, undo);
         stateBudget = true;
         cp.gaps.push({ code: "state_budget", branch: part.branch, partition_id: part.id });
         await persist();
         return;
       }
       const expected = Math.min(pageSize, Math.max(0, row.found - pageNo * pageSize));
-      if (row.items.length < expected) { part.page = pageNo + 1; part.status = "partial"; cp.gaps.push({ code: "short_page", branch: part.branch, partition_id: part.id }); await persist(); return; }
+      if (row.items.length < expected) { part.page = pageNo + 1; part.status = "partial"; addPartitionGap(cp, part, "short_page"); await persist(); return; }
+      if (row.items.length > expected) { part.page = pageNo + 1; part.status = "partial"; addPartitionGap(cp, part, "long_page"); await persist(); return; }
       part.page = pageNo + 1;
       await persist();
     }
@@ -280,8 +428,8 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
       await persist();
       try {
         if (!part.first_page_done) {
+          const undo = beginPage(part);
           cp.counters.logical_pages++;
-          const beforeFirstPageItems = structuredClone(cp.items);
           const first = parsePage(await request(queryFor(part, 0, branch, plan.mode === "fast")));
           part.first_page_done = true;
           part.found = first.found;
@@ -290,24 +438,17 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
           part.page = 1;
           const maxPages = plan.mode === "fast" ? 1 : PAGE_CAP;
           const pageSize = plan.mode === "fast" ? 20 : PAGE_SIZE;
-          addHits(part, first.items.slice(0, pageSize));
+          addHits(part, first.items.slice(0, pageSize), undo);
           if (safeJsonBytes(cp) > CHECKPOINT_LIMIT) {
-            cp.items = beforeFirstPageItems;
-            cp.counters.items = cp.items.length;
-            part.status = "pending";
-            part.page = 0;
-            part.found = undefined;
-            part.found_history = [];
-            part.pages = undefined;
-            part.first_page_done = false;
+            rollbackPage(part, undo);
             stateBudget = true;
-            cp.gaps.push({ code: "state_budget", branch: part.branch, partition_id: part.id });
+            addPartitionGap(cp, part, "state_budget");
             await persist();
             break;
           }
           const expectedPageCount = Math.min(maxPages, Math.ceil(first.found / pageSize));
           if (first.pages !== undefined && first.pages !== expectedPageCount) {
-            cp.gaps.push({ code: "pages_mismatch", branch: part.branch, partition_id: part.id });
+            addPartitionGap(cp, part, "pages_mismatch");
             part.status = "partial";
           }
           if (first.found > maxPages * pageSize && plan.mode !== "fast") {
@@ -325,13 +466,17 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
                 part.status = "done";
                 const suffix = cp.partitions.reduce((n, p) => Math.max(n, Number(p.id.split(".").at(-1)) || 0), 0) + 1;
                 cp.partitions.push(
-                  { ...part, id: `${part.id}.${suffix}`, parent_id: part.id, date_from: toHH(from), date_to: toHH(leftTo), status: "pending", page: 0, found: undefined, found_history: [], pages: undefined, first_page_done: false, error: undefined },
-                  { ...part, id: `${part.id}.${suffix + 1}`, parent_id: part.id, date_from: toHH(rightFrom), date_to: toHH(rightTo), status: "pending", page: 0, found: undefined, found_history: [], pages: undefined, first_page_done: false, error: undefined },
+                  { ...part, id: `${part.id}.${suffix}`, parent_id: part.id, date_from: toHH(from), date_to: toHH(leftTo), status: "pending", page: 0, found: undefined, found_history: [], pages: undefined, first_page_done: false, observed_items: 0, duplicate_items: 0, invalid_items: 0, coverage_invalid: undefined, error: undefined },
+                  { ...part, id: `${part.id}.${suffix + 1}`, parent_id: part.id, date_from: toHH(rightFrom), date_to: toHH(rightTo), status: "pending", page: 0, found: undefined, found_history: [], pages: undefined, first_page_done: false, observed_items: 0, duplicate_items: 0, invalid_items: 0, coverage_invalid: undefined, error: undefined },
                 );
+                partitionItems.set(cp.partitions.at(-2)!.id, new Set());
+                partitionItems.set(cp.partitions.at(-1)!.id, new Set());
                 if (safeJsonBytes(cp) > CHECKPOINT_LIMIT) {
                   cp.partitions.splice(-2);
+                  partitionItems.delete(`${part.id}.${suffix}`);
+                  partitionItems.delete(`${part.id}.${suffix + 1}`);
                   part.status = "partial";
-                  cp.gaps.push({ code: "state_budget", branch: part.branch, partition_id: part.id });
+                  addPartitionGap(cp, part, "state_budget");
                   stateBudget = true;
                   await persist();
                   break;
@@ -341,15 +486,20 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
               }
             }
             part.status = "partial";
-            cp.gaps.push({ code: "unsplittable_over_cap", branch: part.branch, partition_id: part.id });
+            addPartitionGap(cp, part, "unsplittable_over_cap");
           }
-          if (first.found > 0 && first.items.length < Math.min(pageSize, first.found)) {
+          const expectedFirstPage = Math.min(pageSize, first.found);
+          if (first.items.length < expectedFirstPage) {
             part.status = "partial";
-            cp.gaps.push({ code: "short_page", branch: part.branch, partition_id: part.id });
+            addPartitionGap(cp, part, "short_page");
+          }
+          if (first.items.length > expectedFirstPage) {
+            part.status = "partial";
+            addPartitionGap(cp, part, "long_page");
           }
           if (plan.mode === "fast") {
             part.status = "partial";
-            cp.gaps.push({ code: "fast_sample", branch: part.branch, partition_id: part.id });
+            addPartitionGap(cp, part, "fast_sample");
           }
           await persist();
           if (part.status === "running") await paginate(part, branch);
@@ -400,6 +550,7 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
       }
     }
   }
+  reconcileCoverage();
   if (options.signal?.aborted) cp.status = "CANCELLED";
   else cp.status = cp.partitions.every((p) => p.status === "done") && cp.gaps.length === 0 && !stateBudget ? "COMPLETE" : "PARTIAL";
   if (fatalStop && options.signal?.aborted) cp.status = "CANCELLED";

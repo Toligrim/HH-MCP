@@ -122,6 +122,29 @@ describe("local search collection CLI", () => {
     expect(resumed.checkpoint.counters.requests).toBeGreaterThanOrEqual(saved.counters.requests);
   });
 
+  it("persists a duplicate coverage deficit and keeps it partial after CLI resume", async () => {
+    const paths = await setup();
+    const get = vi.fn(async (path: string) => {
+      const pageNo = Number(new URL(path, "https://api.hh.ru").searchParams.get("page") ?? 0);
+      const ids = pageNo === 0
+        ? Array.from({ length: 100 }, (_, i) => String(i + 1))
+        : Array.from({ length: 50 }, (_, i) => String(i + 96));
+      return { found: 150, pages: 2, items: ids.map((id) => ({ id, name: `Vacancy ${id}` })) };
+    });
+    const first = await runSearchCollect(["--spec", paths.spec, "--checkpoint", paths.checkpoint], { lockPath: paths.lock, get: get as never });
+    const saved = JSON.parse(await readFile(paths.checkpoint, "utf8"));
+    const resumedGet = vi.fn();
+
+    const resumed = await runSearchCollect(["--spec", paths.spec, "--checkpoint", paths.checkpoint, "--resume"], { lockPath: paths.lock, get: resumedGet as never });
+
+    expect(first.status).toBe("PARTIAL");
+    expect(saved.status).toBe("PARTIAL");
+    expect(saved.gaps.some((gap: { code?: string }) => gap.code === "coverage_mismatch")).toBe(true);
+    expect(resumedGet).not.toHaveBeenCalled();
+    expect(resumed.status).toBe("PARTIAL");
+    expect(resumed.manifest.gaps.some((gap) => gap.code === "coverage_mismatch")).toBe(true);
+  });
+
   it("takes a global exclusive lock and removes its own lock after completion", async () => {
     const first = await setup();
     const secondSpec = join(first.dir, "second.json");

@@ -41,6 +41,125 @@ describe("deep collector coverage and resume", () => {
     expect(result.manifest.branches.map((b) => b.total_ids)).toEqual([2, 2]);
   });
 
+  it("keeps cross-page duplicate hits partial and preserves their provenance", async () => {
+    const base = plan();
+    const { get } = injected((path) => {
+      const pageNo = Number(new URL(path, "https://api.hh.ru").searchParams.get("page") ?? 0);
+      return page(150, pageNo === 0
+        ? Array.from({ length: 100 }, (_, i) => String(i + 1))
+        : Array.from({ length: 50 }, (_, i) => String(i + 96)));
+    });
+
+    const result = await collectSearch(base, { get: get as never });
+
+    expect(result.status).toBe("PARTIAL");
+    expect(result.manifest.found).toBe(150);
+    expect(result.manifest.known_items).toBe(145);
+    expect(result.items.find((item) => item.id === "96")?.provenance).toHaveLength(1);
+    expect(result.manifest.gaps.some((gap) => gap.code === "duplicate_vacancy_id")).toBe(true);
+    expect(result.manifest.gaps.some((gap) => gap.code === "coverage_mismatch")).toBe(true);
+
+    const noRequests = vi.fn();
+    const resumed = await collectSearch(base, { checkpoint: result.checkpoint, get: noRequests as never });
+    expect(noRequests).not.toHaveBeenCalled();
+    expect(resumed.status).toBe("PARTIAL");
+    expect(resumed.manifest.gaps.some((gap) => gap.code === "duplicate_vacancy_id")).toBe(true);
+
+    const legacy = structuredClone(result.checkpoint);
+    legacy.status = "COMPLETE";
+    legacy.gaps = [];
+    for (const part of legacy.partitions) {
+      delete (part as unknown as Record<string, unknown>).observed_items;
+      delete (part as unknown as Record<string, unknown>).duplicate_items;
+      delete (part as unknown as Record<string, unknown>).invalid_items;
+      delete (part as unknown as Record<string, unknown>).coverage_invalid;
+    }
+    const legacyResume = await collectSearch(base, { checkpoint: legacy, get: noRequests as never });
+    expect(legacyResume.status).toBe("PARTIAL");
+    expect(legacyResume.manifest.gaps.some((gap) => gap.code === "coverage_mismatch")).toBe(true);
+  });
+
+  it("keeps an intra-page duplicate from becoming complete", async () => {
+    const { get } = injected(() => page(3, ["1", "1", "2"]));
+    const result = await collectSearch(plan(), { get: get as never });
+
+    expect(result.status).toBe("PARTIAL");
+    expect(result.items.map((item) => item.id)).toEqual(["1", "2"]);
+    expect(result.manifest.gaps.some((gap) => gap.code === "duplicate_vacancy_id")).toBe(true);
+  });
+
+  it("keeps invalid canonical IDs from being treated as leaf hits", async () => {
+    const { get } = injected(() => ({ found: 1, pages: 1, items: [{ id: "0", name: "Invalid ID" }] }));
+    const result = await collectSearch(plan(), { get: get as never });
+
+    expect(result.status).toBe("PARTIAL");
+    expect(result.items).toEqual([]);
+    expect(result.manifest.gaps.some((gap) => gap.code === "invalid_vacancy_id")).toBe(true);
+    expect(result.manifest.gaps.some((gap) => gap.code === "coverage_mismatch")).toBe(true);
+  });
+
+  it("keeps an overfull first page partial even when its retained IDs equal found", async () => {
+    const { get } = injected(() => page(100, Array.from({ length: 150 }, (_, i) => String(30_000 + i)), 1));
+    const result = await collectSearch(plan(), { get: get as never });
+
+    expect(result.status).toBe("PARTIAL");
+    expect(result.items).toHaveLength(100);
+    expect(result.manifest.gaps.some((gap) => gap.code === "long_page")).toBe(true);
+  });
+
+  it("counts legitimate sibling overlap once when terminal leaves cover the parent result", async () => {
+    const long = planSearch({ native: {}, limits }, Date.UTC(2026, 0, 2));
+    const leftIds = Array.from({ length: 1251 }, (_, i) => String(20_000 + i));
+    const rightIds = Array.from({ length: 1251 }, (_, i) => String(21_250 + i));
+    const get = injected((path) => {
+      const url = new URL(path, "https://api.hh.ru");
+      const root = url.searchParams.get("date_from") === long.frozen_date_bounds.date_from
+        && url.searchParams.get("date_to") === long.frozen_date_bounds.date_to;
+      const pageNo = Number(url.searchParams.get("page") ?? 0);
+      if (root) return page(2501, leftIds.slice(0, 100), 20);
+      const ids = url.searchParams.get("date_from") === long.frozen_date_bounds.date_from ? leftIds : rightIds;
+      return page(ids.length, ids.slice(pageNo * 100, (pageNo + 1) * 100));
+    });
+
+    const result = await collectSearch(long, { get: get.get as never });
+
+    expect(result.status).toBe("COMPLETE");
+    expect(result.manifest.found).toBe(2501);
+    expect(result.manifest.known_items).toBe(2501);
+    expect(result.manifest.gaps).toEqual([]);
+    expect(result.items.find((item) => item.id === "21250")?.provenance.map((p) => p.partition_id)).toHaveLength(2);
+  });
+
+  it("detects split-parent versus completed-leaf index drift and keeps the diagnostic on resume", async () => {
+    const long = planSearch({ native: {}, limits }, Date.UTC(2026, 0, 2));
+    const get = injected((path) => {
+      const url = new URL(path, "https://api.hh.ru");
+      const root = url.searchParams.get("date_from") === long.frozen_date_bounds.date_from
+        && url.searchParams.get("date_to") === long.frozen_date_bounds.date_to;
+      return root ? page(2501, Array.from({ length: 100 }, (_, i) => String(500 + i)), 20) : page(1, ["500"]);
+    });
+    const first = await collectSearch(long, { get: get.get as never });
+
+    expect(first.status).toBe("PARTIAL");
+    expect(first.manifest.known_items).toBe(100);
+    expect(first.manifest.gaps.some((gap) => gap.code === "coverage_mismatch" && gap.partition_id === "1")).toBe(true);
+
+    const legacyLooking = structuredClone(first.checkpoint);
+    legacyLooking.status = "COMPLETE";
+    legacyLooking.gaps = legacyLooking.gaps.filter((gap) => gap.code !== "coverage_mismatch");
+    for (const part of legacyLooking.partitions) {
+      delete (part as unknown as Record<string, unknown>).observed_items;
+      delete (part as unknown as Record<string, unknown>).duplicate_items;
+      delete (part as unknown as Record<string, unknown>).invalid_items;
+      delete (part as unknown as Record<string, unknown>).coverage_invalid;
+    }
+    const noRequests = vi.fn();
+    const resumed = await collectSearch(long, { checkpoint: legacyLooking, get: noRequests as never });
+    expect(noRequests).not.toHaveBeenCalled();
+    expect(resumed.status).toBe("PARTIAL");
+    expect(resumed.manifest.gaps.some((gap) => gap.code === "coverage_mismatch" && gap.partition_id === "1")).toBe(true);
+  });
+
   it("rejects changed signatures and resumes cumulative request counters", async () => {
     const base = plan();
     const { get } = injected(() => page(1, ["9"]));
@@ -294,6 +413,19 @@ describe("deep collector coverage and resume", () => {
     expect(result.manifest.gaps.map((gap) => gap.code)).toContain("pages_changed");
   });
 
+  it.each([99, 102])("retains found observations and reports upward or downward index drift to %i", async (nextFound) => {
+    const get = injected((path) => {
+      const pageNo = Number(new URL(path, "https://api.hh.ru").searchParams.get("page") ?? 0);
+      if (pageNo === 0) return page(101, Array.from({ length: 100 }, (_, i) => String(10_000 + i)), 2);
+      return { found: nextFound, pages: 2, items: nextFound < 101 ? [] : [vacancy("10099"), vacancy("10100")] };
+    });
+    const result = await collectSearch(plan(), { get: get.get as never });
+
+    expect(result.status).toBe("PARTIAL");
+    expect(result.checkpoint.partitions[0]?.found_history).toEqual([101, nextFound]);
+    expect(result.manifest.gaps.some((gap) => gap.code === "found_changed")).toBe(true);
+  });
+
   it("marks a short continuation page partial and retains prior page hits", async () => {
     const { get } = injected((path) => {
       const pageNo = Number(new URL(path, "https://api.hh.ru").searchParams.get("page") ?? 0);
@@ -333,6 +465,60 @@ describe("deep collector coverage and resume", () => {
     const secondGet = vi.fn();
     await expect(collectSearch(base, { checkpoint: badItem, get: secondGet as never })).rejects.toThrow(/item/i);
     expect(secondGet).not.toHaveBeenCalled();
+  });
+
+  it("loads old v1 checkpoints from provenance and rejects repeated global item IDs", async () => {
+    const base = plan();
+    const first = await collectSearch(base, { get: injected(() => page(1, ["7"])).get as never });
+    const old = structuredClone(first.checkpoint);
+    for (const part of old.partitions) {
+      delete (part as unknown as Record<string, unknown>).observed_items;
+      delete (part as unknown as Record<string, unknown>).duplicate_items;
+      delete (part as unknown as Record<string, unknown>).invalid_items;
+      delete (part as unknown as Record<string, unknown>).coverage_invalid;
+    }
+    const noRequests = vi.fn();
+    const resumed = await collectSearch(base, { checkpoint: old, get: noRequests as never });
+    expect(noRequests).not.toHaveBeenCalled();
+    expect(resumed.status).toBe("COMPLETE");
+
+    const duplicateId = structuredClone(first.checkpoint);
+    duplicateId.items.push(structuredClone(duplicateId.items[0]!));
+    duplicateId.counters.items = duplicateId.items.length;
+    const rejectedGet = vi.fn();
+    await expect(collectSearch(base, { checkpoint: duplicateId, get: rejectedGet as never })).rejects.toThrow(/duplicate global checkpoint item/i);
+    expect(rejectedGet).not.toHaveBeenCalled();
+  });
+
+  it("does not trust coverage counters that disagree with stored provenance", async () => {
+    const base = plan();
+    const first = await collectSearch(base, { get: injected(() => page(1, ["17"])).get as never });
+    const invalid = structuredClone(first.checkpoint);
+    const partition = invalid.partitions[0] as unknown as Record<string, unknown>;
+    partition.observed_items = 2;
+    partition.duplicate_items = 0;
+    partition.invalid_items = 0;
+    const noRequests = vi.fn();
+
+    const resumed = await collectSearch(base, { checkpoint: invalid, get: noRequests as never });
+
+    expect(noRequests).not.toHaveBeenCalled();
+    expect(resumed.status).toBe("PARTIAL");
+    expect(resumed.manifest.gaps.some((gap) => gap.code === "coverage_state_invalid")).toBe(true);
+  });
+
+  it("counts duplicate provenance aliases once when reconstructing a leaf membership set", async () => {
+    const base = plan();
+    const first = await collectSearch(base, { get: injected(() => page(1, ["18"])).get as never });
+    const alias = structuredClone(first.checkpoint);
+    alias.items[0]!.provenance.push({ ...alias.items[0]!.provenance[0]! });
+    const noRequests = vi.fn();
+
+    const resumed = await collectSearch(base, { checkpoint: alias, get: noRequests as never });
+
+    expect(noRequests).not.toHaveBeenCalled();
+    expect(resumed.status).toBe("COMPLETE");
+    expect(resumed.manifest.gaps).toEqual([]);
   });
 
   it("splits an exactly 15-minute overloaded window when both children strictly shrink", async () => {
@@ -455,6 +641,61 @@ describe("deep collector coverage and resume", () => {
     expect(resumed.checkpoint.counters.requests).toBe(result.checkpoint.counters.requests + 1);
     expect(resumed.checkpoint.counters.bytes).toBeGreaterThan(result.checkpoint.counters.bytes);
     expect(resumed.items).toHaveLength(200);
+  });
+
+  it("rolls back only the oversized page while restoring prior item provenance and metadata", async () => {
+    const multi = planSearch({
+      native: {},
+      branches: [{ name: "a", native: { text: "a" } }, { name: "b", native: { text: "b" } }],
+      limits: { ...limits, max_bytes: 64 * 1024 * 1024 },
+    }, Date.UTC(2026, 0, 2));
+    const hugeName = "x".repeat(34 * 1024 * 1024);
+    const get = injected((path) => {
+      const text = new URL(path, "https://api.hh.ru").searchParams.get("text");
+      if (text === "a") return page(1, ["42"]);
+      return { found: 2, pages: 1, items: [vacancy("42"), { id: "9000", name: hugeName }] };
+    });
+    let savedAfterFirstBranch: import("../collector.js").CollectorCheckpoint | undefined;
+
+    const result = await collectSearch(multi, { get: get.get as never, onCheckpoint: async (state) => {
+      if (!savedAfterFirstBranch && state.partitions[0]?.status === "done" && state.partitions[1]?.status === "pending") {
+        savedAfterFirstBranch = structuredClone(state);
+      }
+    } });
+
+    expect(result.status).toBe("PARTIAL");
+    expect(result.checkpoint.partitions[1]).toMatchObject({ status: "pending", page: 0, first_page_done: false, observed_items: 0, duplicate_items: 0 });
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.raw_search.name).toBe("Vacancy 42");
+    expect(result.items[0]?.provenance.map((entry) => entry.branch)).toEqual(["a"]);
+    expect(result.items[0]?.last_fetched_at).toBe(savedAfterFirstBranch?.items[0]?.last_fetched_at);
+    expect(result.checkpoint.counters.requests).toBe(2);
+    expect(result.checkpoint.counters.bytes).toBeGreaterThan(34 * 1024 * 1024);
+
+    const resumed = await collectSearch(multi, { checkpoint: result.checkpoint, get: injected((path) => {
+      const text = new URL(path, "https://api.hh.ru").searchParams.get("text");
+      return text === "b" ? page(2, ["42", "9000"]) : page(1, ["42"]);
+    }).get as never });
+    expect(resumed.items.find((item) => item.id === "42")?.provenance.map((entry) => entry.branch)).toEqual(["a", "b"]);
+    expect(resumed.items.some((item) => item.id === "9000")).toBe(true);
+  });
+
+  it("accepts a checkpoint whose serialized state is exactly 32 MiB", async () => {
+    const base = plan();
+    const first = await collectSearch(base, { get: injected(() => page(1, ["42"])).get as never });
+    const boundary = structuredClone(first.checkpoint);
+    boundary.counters.active_elapsed_ms = 20_000;
+    const item = boundary.items[0]!;
+    const name = String(item.raw_search.name);
+    const currentBytes = Buffer.byteLength(JSON.stringify(boundary), "utf8");
+    item.raw_search.name = "x".repeat(32 * 1024 * 1024 - currentBytes + name.length);
+    expect(Buffer.byteLength(JSON.stringify(boundary), "utf8")).toBe(32 * 1024 * 1024);
+
+    const noRequests = vi.fn();
+    const resumed = await collectSearch(base, { checkpoint: boundary, get: noRequests as never });
+
+    expect(noRequests).not.toHaveBeenCalled();
+    expect(resumed.status).toBe("COMPLETE");
   });
 
   it("uses real hhGet with mocked fetch and charges attempts to max_requests exactly once", async () => {
