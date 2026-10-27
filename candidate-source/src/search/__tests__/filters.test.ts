@@ -8,6 +8,13 @@ describe("post filters", () => {
     "TWO_ON_ONE_OFF", "ONE_ON_THREE_OFF", "ONE_ON_TWO_OFF", "WEEKEND", "FLEXIBLE", "OTHER",
   ];
   const formatIds = ["ON_SITE", "REMOTE", "HYBRID", "FIELD_WORK"];
+  const scheduleLabels: Record<string, string> = {
+    SIX_ON_ONE_OFF: "6/1", FIVE_ON_TWO_OFF: "5/2", FOUR_ON_FOUR_OFF: "4/4", FOUR_ON_THREE_OFF: "4/3",
+    FOUR_ON_TWO_OFF: "4/2", THREE_ON_THREE_OFF: "3/3", THREE_ON_TWO_OFF: "3/2", TWO_ON_TWO_OFF: "2/2",
+    TWO_ON_ONE_OFF: "2/1", ONE_ON_THREE_OFF: "1/3", ONE_ON_TWO_OFF: "1/2", WEEKEND: "По выходным",
+    FLEXIBLE: "Свободный", OTHER: "Другое",
+  };
+  const formatLabels: Record<string, string> = { ON_SITE: "На месте работодателя", REMOTE: "Удалённо", HYBRID: "Гибрид", FIELD_WORK: "Разъездной" };
 
   it("requires strict discriminated rules and bounds their count", () => {
     expect(postFilterSchema.safeParse({ rule: "night_shifts", value: false }).success).toBe(true);
@@ -82,16 +89,21 @@ describe("post filters", () => {
     for (const id of scheduleIds) {
       const rule = { rule: "work_schedule_by_days", value: id } as const;
       expect(evaluatePostFilters({ work_schedule_by_days: id }, [rule], "review").rules[0]?.state, id).toBe("match");
-      expect(evaluatePostFilters({ work_schedule_by_days: [{ id, name: id }] }, [rule], "review").rules[0]?.state, id).toBe("match");
+      expect(evaluatePostFilters({ work_schedule_by_days: [{ id, name: scheduleLabels[id] }] }, [rule], "review").rules[0]?.state, id).toBe("match");
+      for (const otherId of scheduleIds.filter((candidate) => candidate !== id)) {
+        expect(evaluatePostFilters({ work_schedule_by_days: [{ id, name: scheduleLabels[otherId] }] }, [rule], "review").rules[0]?.state, `${id}/${otherId}`).toBe("unknown");
+      }
     }
   });
 
   it("matches every official structured work format ID without merging on-site and field work", () => {
-    const names: Record<string, string> = { ON_SITE: "На месте работодателя", REMOTE: "Удалённо", HYBRID: "Гибрид", FIELD_WORK: "Разъездной" };
     for (const id of formatIds) {
       const rule = { rule: "work_format", value: id } as const;
       expect(evaluatePostFilters({ work_format: id }, [rule], "review").rules[0]?.state, id).toBe("match");
-      expect(evaluatePostFilters({ work_format: [{ id, name: names[id] }] }, [rule], "review").rules[0]?.state, id).toBe("match");
+      expect(evaluatePostFilters({ work_format: [{ id, name: formatLabels[id] }] }, [rule], "review").rules[0]?.state, id).toBe("match");
+      for (const otherId of formatIds.filter((candidate) => candidate !== id)) {
+        expect(evaluatePostFilters({ work_format: [{ id, name: formatLabels[otherId] }] }, [rule], "review").rules[0]?.state, `${id}/${otherId}`).toBe("unknown");
+      }
     }
     expect(evaluatePostFilters({ work_format: [{ id: "FIELD_WORK" }] }, [{ rule: "work_format", value: "ON_SITE" }], "review").rules[0]?.state).toBe("no_match");
     expect(evaluatePostFilters({ work_format: [{ id: "ON_SITE" }] }, [{ rule: "work_format", value: "FIELD_WORK" }], "review").rules[0]?.state).toBe("no_match");
@@ -115,12 +127,44 @@ describe("post filters", () => {
     expect(evaluatePostFilters({ work_schedule_by_days: [{ id: "TWO_ON_TWO_OFF", name: "5/2" }] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("unknown");
     expect(evaluatePostFilters({ work_schedule_by_days: [{ id: "TWO_ON_TWO_OFF", name: "Индивидуально" }] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("match");
     expect(evaluatePostFilters({ work_format: [{ id: "ON_SITE", name: "Удалённо" }] }, [{ rule: "work_format", value: "ON_SITE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: [{ id: "REMOTE", name: "На месте работодателя" }] }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: [{ id: "REMOTE", name: "На\u00a0месте работодателя" }] }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("unknown");
     expect(evaluatePostFilters({ work_format: [{ id: "REMOTE", name: "Индивидуально" }] }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("match");
     expect(evaluatePostFilters({ work_schedule_by_days: "TWO_ON_TWO_OFF", description: "График 5/2" }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("unknown");
     expect(evaluatePostFilters({ work_format: "REMOTE", description: "Работа в офисе" }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("unknown");
     expect(evaluatePostFilters({ description: "График работы 2/2" }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("match");
     expect(evaluatePostFilters({ description: "Remote work" }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("match");
     expect(evaluatePostFilters({ description: "Разъездной характер работы" }, [{ rule: "work_format", value: "FIELD_WORK" }], "review").rules[0]?.state).toBe("match");
+  });
+
+  it("keeps denied numeric schedule labels unknown in structured and description-only evidence", () => {
+    const numericSchedules = Object.entries(scheduleLabels).filter(([id]) => id !== "WEEKEND" && id !== "FLEXIBLE" && id !== "OTHER");
+    for (const [index, [id, label]] of numericSchedules.entries()) {
+      const rule = { rule: "work_schedule_by_days", value: id } as const;
+      const denial = index % 2 === 0 ? `График ${label} не предлагается.` : `Schedule ${label} is not available.`;
+      expect(evaluatePostFilters({ work_schedule_by_days: [{ id }], description: denial }, [rule], "review").rules[0]?.state, `structured ${id}`).toBe("unknown");
+      expect(evaluatePostFilters({ description: denial }, [rule], "review").rules[0]?.state, `description ${id}`).toBe("unknown");
+      expect(evaluatePostFilters({ work_schedule_by_days: [{ id }], description: `График ${label}.` }, [rule], "review").rules[0]?.state, `affirmative ${id}`).toBe("match");
+    }
+    expect(evaluatePostFilters({ description: "Schedule 2/2 is not offered." }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_schedule_by_days: ["FIVE_ON_TWO_OFF", "TWO_ON_TWO_OFF"] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("match");
+  });
+
+  it("keeps denied work formats unknown in structured and description-only evidence", () => {
+    const denials: Record<string, string[]> = {
+      REMOTE: ["Удалённая работа не предлагается.", "Remote work is not available."],
+      HYBRID: ["Гибридный формат не предлагается.", "No hybrid work is offered."],
+      FIELD_WORK: ["Разъездной характер работы не предусмотрен.", "Field work is not available."],
+      ON_SITE: ["Работа на месте работодателя не предлагается.", "Onsite work is not available."],
+    };
+    for (const id of formatIds) {
+      for (const denial of denials[id]!) {
+        const rule = { rule: "work_format", value: id } as const;
+        expect(evaluatePostFilters({ work_format: [{ id }], description: denial }, [rule], "review").rules[0]?.state, `structured ${id}: ${denial}`).toBe("unknown");
+        expect(evaluatePostFilters({ description: denial }, [rule], "review").rules[0]?.state, `description ${id}: ${denial}`).toBe("unknown");
+      }
+      expect(evaluatePostFilters({ work_format: [{ id }], description: formatLabels[id] }, [{ rule: "work_format", value: id }], "review").rules[0]?.state, `affirmative ${id}`).toBe("match");
+    }
   });
 
   it("applies strict, inclusive and review decision policies", () => {
