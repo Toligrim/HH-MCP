@@ -67,7 +67,7 @@ function canonicalSchedule(value: string): string | undefined {
 
 function schedulePattern(id: string): string | undefined {
   const numeric = scheduleLabels[id];
-  if (/^\d\/\d$/.test(numeric ?? "")) return (numeric ?? "").replace("/", "\\s*[/\\-]\\s*");
+  if (/^\d\/\d$/.test(numeric ?? "")) return `(?<!\\d)${(numeric ?? "").replace("/", "\\s*[/\\-]\\s*")}(?!\\d)`;
   if (id === "WEEKEND") return "(?:weekends?(?:\\s+schedule)?|(?:работа\\s+)?по\\s+выходным|выходн[а-яё]*\\s+(?:график|работа))";
   if (id === "FLEXIBLE") return "(?:flexible\\s+(?:work\\s+)?schedule|гибк[а-яё]*\\s+(?:график|расписание)|свободн[а-яё]*\\s+(?:график|расписание))";
   if (id === "OTHER") return "(?:other\\s+(?:work\\s+)?schedule|(?:другой|иной)\\s+(?:график|режим|расписание)|другое\\s+(?:расписание|график))";
@@ -185,8 +185,8 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
     const values = stringsFrom(vacancy.work_schedule_by_days);
     const wanted = canonicalSchedule(rule.value);
     if (!wanted || !scheduleIds.has(wanted)) return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: "Unknown requested schedule" };
-    const wantedPattern = wanted === "TWO_ON_TWO_OFF" ? "(?:2\\s*[/\\-]\\s*2|two\\s+on\\s+two\\s+off|2\\s+через\\s+2|два\\s+через\\s+два)"
-      : wanted === "FIVE_ON_TWO_OFF" ? "(?:5\\s*[/\\-]\\s*2|five\\s+on\\s+two\\s+off|5\\s+через\\s+2|пять\\s+через\\s+два)"
+    const wantedPattern = wanted === "TWO_ON_TWO_OFF" ? `(?:${schedulePattern(wanted)}|two\\s+on\\s+two\\s+off|2\\s+через\\s+2|два\\s+через\\s+два)`
+      : wanted === "FIVE_ON_TWO_OFF" ? `(?:${schedulePattern(wanted)}|five\\s+on\\s+two\\s+off|5\\s+через\\s+2|пять\\s+через\\s+два)`
         : schedulePattern(wanted);
     const negatedWanted = wantedPattern && clauses(description).some((part) => {
       const negatedBefore = new RegExp(`(?:\\b(?:not|do not|does not|don't|doesn't)(?:\\s+(?:work|offer|use|follow|schedule)){0,3}\\s+|\\bno\\s+|не\\s+(?:работаем\\s+)?)(?:schedule\\s+)?${wantedPattern}`, "iu");

@@ -150,6 +150,21 @@ describe("post filters", () => {
     expect(evaluatePostFilters({ work_schedule_by_days: ["FIVE_ON_TWO_OFF", "TWO_ON_TWO_OFF"] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("match");
   });
 
+  it("requires digit boundaries around numeric schedule descriptions", () => {
+    const numericSchedules = Object.entries(scheduleLabels).filter(([id]) => id !== "WEEKEND" && id !== "FLEXIBLE" && id !== "OTHER");
+    for (const [id, label] of numericSchedules) {
+      const rule = { rule: "work_schedule_by_days", value: id } as const;
+      const [on, off] = label.split("/");
+      expect(evaluatePostFilters({ description: `Schedule ${label}.` }, [rule], "review").rules[0]?.state, `affirmative ${id}`).toBe("match");
+      expect(evaluatePostFilters({ description: `Schedule 1${on}/${off}.` }, [rule], "review").rules[0]?.state, `long numerator ${id}`).toBe("unknown");
+      expect(evaluatePostFilters({ description: `Schedule ${on}/${off}0.` }, [rule], "review").rules[0]?.state, `long denominator ${id}`).toBe("unknown");
+    }
+    const structuredRule = { rule: "work_schedule_by_days", value: "SIX_ON_ONE_OFF" } as const;
+    const result = evaluatePostFilters({ work_schedule_by_days: [{ id: "SIX_ON_ONE_OFF" }], description: "Schedule 16/1." }, [structuredRule], "review").rules[0];
+    expect(result?.state).toBe("match");
+    expect(result?.source).toBe("work_schedule_by_days");
+  });
+
   it("keeps denied work formats unknown in structured and description-only evidence", () => {
     const denials: Record<string, string[]> = {
       REMOTE: ["Удалённая работа не предлагается.", "Remote work is not available."],
