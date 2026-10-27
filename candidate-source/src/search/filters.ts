@@ -78,6 +78,22 @@ function schedulePattern(id: string): string | undefined {
   return undefined;
 }
 
+function scheduleDenialPattern(id: string): string | undefined {
+  const pattern = schedulePattern(id);
+  if (!pattern) return undefined;
+  if (id === "TWO_ON_TWO_OFF") return `(?:${pattern}|two\\s+on\\s+two\\s+off|2\\s+через\\s+2|два\\s+через\\s+два)`;
+  if (id === "FIVE_ON_TWO_OFF") return `(?:${pattern}|five\\s+on\\s+two\\s+off|5\\s+через\\s+2|пять\\s+через\\s+два)`;
+  return pattern;
+}
+
+function scheduleDenied(id: string, clause: string): boolean {
+  const pattern = scheduleDenialPattern(id);
+  if (!pattern) return false;
+  const deniedBefore = new RegExp(`(?:\\b(?:not|do not|does not|don't|doesn't)(?:\\s+(?:work|offer|use|follow|schedule)){0,3}\\s+|\\bno\\s+|не\\s+(?:работаем\\s+)?)(?:schedule\\s+)?${pattern}`, "iu");
+  const deniedAfter = new RegExp(`${pattern}\\s+(?:(?:is|was)\\s+)?(?:not\\s+(?:offered|available|used|followed)|isn't\\s+(?:offered|available)|unavailable|не\\s+(?:предлагается|доступ[а-яё]*|используется)|недоступ[а-яё]*)`, "iu");
+  return deniedBefore.test(clause) || deniedAfter.test(clause);
+}
+
 function schedulesInDescription(value: string): string[] {
   return clauses(value).flatMap((part) => [...scheduleIds].filter((id) => {
     const pattern = schedulePattern(id);
@@ -177,7 +193,11 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
       }
     }
     const descClauses = clauses(description);
-    if (wanted && descClauses.some((part) => formatDenied(wanted, part))) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
+    const deniedFormats = new Set(([
+      "remote", "hybrid", "office", "field",
+    ] as const).filter((kind) => descClauses.some((part) => formatDenied(kind, part))));
+    if (wanted && deniedFormats.has(wanted)) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
+    if (structuredKinds.some((kind) => deniedFormats.has(kind))) return { state: "unknown", confidence: 0, source: "work_format,description", evidence: excerpt(description) };
     const remoteDenied = descClauses.some((part) => /(?:remote|удал[её]н|дистанцион).{0,45}(?:not\s+available|unavailable|not\s+offered|not\s+allowed|не\s+доступ|не\s+предусмотр|нельзя)/i.test(part)
       || /(?:\bno\s+remote\b|\bremote\s+(?:work|work\s+format)\s+(?:is\s+)?(?:not\s+available|unavailable|not\s+offered|not\s+allowed)|не\s+(?:предусмотрена\s+)?удал[её]н|удал[её]н\w*.{0,30}не\s+(?:доступ|предусмотр|разреш))/i.test(part));
     const mandatoryOffice = descClauses.some((part) => /(?:mandatory|обязательн|требуется).{0,45}(?:office|офис)|(?:office|офис).{0,45}(?:mandatory|required|обязательн)/i.test(part));
@@ -188,9 +208,9 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
       if (/(?:field\s*work|разъездн[а-яё]*\s+(?:формат|работа|характер)|работа\s+разъездн[а-яё]*)/iu.test(part)) kinds.push("field");
       if (/(?:office[- ]based|onsite\s+(?:work|position)|work\s+from\s+(?:the\s+)?office|работа\s+в\s+офисе|офисный\s+формат|обязательное\s+присутствие\s+в\s+офисе)/iu.test(part)) kinds.push("office");
       return kinds;
-    });
+    }).filter((kind) => !deniedFormats.has(kind));
     const evidenced = [...new Set([...structuredKinds, ...descriptionKinds])];
-    if (remoteDenied && (structuredKinds.includes("remote") || descriptionKinds.includes("remote"))) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
+    if (remoteDenied && structuredKinds.includes("remote")) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
     if ((structuredKinds.includes("remote") || descriptionKinds.includes("remote")) && mandatoryOffice) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
     if ((!structuredKinds.length && evidenced.length > 1) || (structuredKinds.length && descriptionKinds.some((kind) => !structuredKinds.includes(kind)))) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description || values.join(" ")) };
     if (!evidenced.length || !wanted) return { state: "unknown", confidence: 0, source: "work_format", evidence: "No explicit work format evidence" };
@@ -203,15 +223,8 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
     const values = stringsFrom(vacancy.work_schedule_by_days);
     const wanted = canonicalSchedule(rule.value);
     if (!wanted || !scheduleIds.has(wanted)) return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: "Unknown requested schedule" };
-    const wantedPattern = wanted === "TWO_ON_TWO_OFF" ? `(?:${schedulePattern(wanted)}|two\\s+on\\s+two\\s+off|2\\s+через\\s+2|два\\s+через\\s+два)`
-      : wanted === "FIVE_ON_TWO_OFF" ? `(?:${schedulePattern(wanted)}|five\\s+on\\s+two\\s+off|5\\s+через\\s+2|пять\\s+через\\s+два)`
-        : schedulePattern(wanted);
-    const negatedWanted = wantedPattern && clauses(description).some((part) => {
-      const negatedBefore = new RegExp(`(?:\\b(?:not|do not|does not|don't|doesn't)(?:\\s+(?:work|offer|use|follow|schedule)){0,3}\\s+|\\bno\\s+|не\\s+(?:работаем\\s+)?)(?:schedule\\s+)?${wantedPattern}`, "iu");
-      const negatedAfter = new RegExp(`${wantedPattern}\\s+(?:(?:is|was)\\s+)?(?:not\\s+(?:offered|available|used|followed)|isn't\\s+(?:offered|available)|не\\s+(?:предлагается|доступен|используется))`, "iu");
-      return negatedBefore.test(part) || negatedAfter.test(part);
-    });
-    if (negatedWanted) return { state: "unknown", confidence: 0, source: values.length ? "work_schedule_by_days,description" : "description", evidence: excerpt(description) };
+    const deniedSchedule = [...scheduleIds].some((id) => clauses(description).some((part) => scheduleDenied(id, part)));
+    if (deniedSchedule) return { state: "unknown", confidence: 0, source: values.length ? "work_schedule_by_days,description" : "description", evidence: excerpt(description) };
     if (entries.length) {
       const actual: string[] = [];
       for (const entry of entries) {

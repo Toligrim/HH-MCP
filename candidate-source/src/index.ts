@@ -1,10 +1,19 @@
 #!/usr/bin/env node
 
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { type ZodRawShape, type ZodObject } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  CancelledNotificationSchema,
+  ErrorCode,
+  isJSONRPCErrorResponse,
+  isJSONRPCNotification,
+  isJSONRPCResultResponse,
+  JSONRPCRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { VERSION } from "./version.js";
 import {
   searchVacanciesSchema,
@@ -801,6 +810,456 @@ function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
+const DEFAULT_HTTP_SESSION_LIMIT = 128;
+const DEFAULT_HTTP_SESSION_IDLE_MS = 15 * 60 * 1000;
+const DEFAULT_HTTP_SESSION_ACTIVE_LIMIT = 32;
+const MCP_SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+type HttpMcpSession = {
+  id?: string;
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+  activeRequests: number;
+  controlRequests: number;
+  requestGroups: Set<HttpMcpRequestGroup>;
+  requestGroupsById: Map<string | number, HttpMcpRequestGroup>;
+  reservationHeld: boolean;
+  closed: boolean;
+  idleTimer?: NodeJS.Timeout;
+};
+
+type HttpMcpRequestGroup = {
+  response: http.ServerResponse;
+  requestIds: Set<string | number>;
+  cancelledIds: Set<string | number>;
+  completedIds: Set<string | number>;
+  cancellationResponsesSent: Set<string | number>;
+  cleanupStarted: boolean;
+};
+
+export type HttpMcpServerOptions = {
+  port?: number;
+  allowedHosts?: string[];
+  allowedOrigins?: string[];
+  maxSessions?: number;
+  maxActiveRequestsPerSession?: number;
+  sessionIdleTimeoutMs?: number;
+};
+
+const httpSessionClosers = new WeakMap<http.Server, () => Promise<void>>();
+
+function messagesFromBody(body: unknown): unknown[] {
+  return Array.isArray(body) ? body : [body];
+}
+
+function isInitializeBody(body: unknown): boolean {
+  return messagesFromBody(body).some((message) => message !== null && typeof message === "object" &&
+    (message as Record<string, unknown>).method === "initialize");
+}
+
+function requestIdsFromBody(body: unknown): Array<string | number> {
+  return messagesFromBody(body).flatMap((message) => {
+    const parsed = JSONRPCRequestSchema.safeParse(message);
+    return parsed.success ? [parsed.data.id] : [];
+  });
+}
+
+function validatedCancellationRequestId(message: unknown): string | number | undefined {
+  if (!isJSONRPCNotification(message)) return undefined;
+  const parsed = CancelledNotificationSchema.safeParse(message);
+  if (!parsed.success) return undefined;
+  const requestId = parsed.data.params.requestId;
+  return typeof requestId === "string" || typeof requestId === "number" ? requestId : undefined;
+}
+
+function isCancellationOnlyPayload(body: unknown): boolean {
+  const messages = messagesFromBody(body);
+  return messages.length === 1 && validatedCancellationRequestId(messages[0]) !== undefined;
+}
+
+function writeJsonRpcError(res: http.ServerResponse, status: number, code: number, message: string): void {
+  if (res.headersSent) return;
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    ...(status === 413 ? { Connection: "close" } : {}),
+  });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }), () => {
+    if (status === 413) res.req.destroy();
+  });
+}
+
+export async function closeHttpMcpSessions(server: http.Server): Promise<void> {
+  await httpSessionClosers.get(server)?.();
+}
+
+export function createHttpServer(options: HttpMcpServerOptions = {}): http.Server {
+  const port = options.port ?? Number(process.env.HTTP_PORT || process.env.PORT || 3000);
+  const allowedHosts = options.allowedHosts ?? (process.env.HH_ALLOWED_HOSTS || `127.0.0.1:${port},localhost:${port}`)
+    .split(",").map((value) => value.trim()).filter(Boolean);
+  const configuredOrigins = options.allowedOrigins ?? (process.env.HH_ALLOWED_ORIGINS
+    ? process.env.HH_ALLOWED_ORIGINS.split(",").map((value) => value.trim()).filter(Boolean)
+    : undefined);
+  const maxSessions = options.maxSessions ?? DEFAULT_HTTP_SESSION_LIMIT;
+  const maxActiveRequestsPerSession = options.maxActiveRequestsPerSession ?? DEFAULT_HTTP_SESSION_ACTIVE_LIMIT;
+  const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? DEFAULT_HTTP_SESSION_IDLE_MS;
+  if (!Number.isSafeInteger(maxSessions) || maxSessions < 1) throw new RangeError("maxSessions must be a positive safe integer");
+  if (!Number.isSafeInteger(maxActiveRequestsPerSession) || maxActiveRequestsPerSession < 1) throw new RangeError("maxActiveRequestsPerSession must be a positive safe integer");
+  if (!Number.isSafeInteger(sessionIdleTimeoutMs) || sessionIdleTimeoutMs < 1) throw new RangeError("sessionIdleTimeoutMs must be a positive safe integer");
+
+  const sessions = new Map<string, HttpMcpSession>();
+  const trackedSessions = new Set<HttpMcpSession>();
+  let pendingSessionInitializations = 0;
+  let shuttingDown = false;
+
+  const removeSessionEntry = (session: HttpMcpSession): void => {
+    if (session.id && sessions.get(session.id) === session) sessions.delete(session.id);
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = undefined;
+    if (session.reservationHeld) {
+      pendingSessionInitializations = Math.max(0, pendingSessionInitializations - 1);
+      session.reservationHeld = false;
+    }
+    session.closed = true;
+    trackedSessions.delete(session);
+  };
+
+  const disposeSession = async (session: HttpMcpSession): Promise<void> => {
+    if (session.closed) return;
+    removeSessionEntry(session);
+    await session.server.close().catch(() => undefined);
+  };
+
+  const scheduleSessionExpiry = (session: HttpMcpSession): void => {
+    if (!session.id || session.activeRequests + session.controlRequests > 0 || session.closed || sessions.get(session.id) !== session) return;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = setTimeout(() => { void disposeSession(session); }, sessionIdleTimeoutMs);
+    session.idleTimer.unref?.();
+  };
+
+  const createStatefulSession = (): HttpMcpSession => {
+    const server = createServer();
+    const sessionRef: { current?: HttpMcpSession } = {};
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: randomUUID,
+      onsessioninitialized: (id) => {
+        const session = sessionRef.current!;
+        if (session.reservationHeld) {
+          pendingSessionInitializations = Math.max(0, pendingSessionInitializations - 1);
+          session.reservationHeld = false;
+        }
+        if (shuttingDown || session.closed) return;
+        session.id = id;
+        sessions.set(id, session);
+      },
+      onsessionclosed: async () => {
+        const session = sessionRef.current;
+        if (!session) return;
+        removeSessionEntry(session);
+        await session.server.close().catch(() => undefined);
+      },
+      enableDnsRebindingProtection: true,
+      maxRequestBodySize: MAX_BODY,
+      allowedHosts,
+      ...(configuredOrigins ? { allowedOrigins: configuredOrigins } : {}),
+    });
+    const session: HttpMcpSession = {
+      server,
+      transport,
+      activeRequests: 0,
+      controlRequests: 0,
+      requestGroups: new Set(),
+      requestGroupsById: new Map(),
+      reservationHeld: true,
+      closed: false,
+    };
+    sessionRef.current = session;
+    trackedSessions.add(session);
+    return session;
+  };
+
+  const removeRequestGroup = (session: HttpMcpSession, group: HttpMcpRequestGroup): void => {
+    session.requestGroups.delete(group);
+    for (const requestId of group.requestIds) {
+      if (session.requestGroupsById.get(requestId) === group) session.requestGroupsById.delete(requestId);
+    }
+  };
+
+  const cancelledRequestError = (requestId: string | number) => ({
+    jsonrpc: "2.0" as const,
+    id: requestId,
+    error: { code: ErrorCode.ConnectionClosed, message: "Request cancelled." },
+  });
+
+  const settleCancelledGroup = async (session: HttpMcpSession, group: HttpMcpRequestGroup): Promise<void> => {
+    if (group.cleanupStarted || group.cancelledIds.size === 0) return;
+    const pendingSiblingIds = [...group.requestIds].filter((id) => !group.cancelledIds.has(id) && !group.completedIds.has(id));
+    const transportSend = session.transport.send.bind(session.transport);
+
+    if (pendingSiblingIds.length > 0 && !group.response.destroyed && !group.response.writableFinished) {
+      for (const requestId of group.cancelledIds) {
+        if (group.cancellationResponsesSent.has(requestId)) continue;
+        group.cancellationResponsesSent.add(requestId);
+        try {
+          await transportSend(cancelledRequestError(requestId));
+        } catch {
+          group.cancellationResponsesSent.delete(requestId);
+        }
+      }
+      if ([...group.requestIds].every((id) => group.completedIds.has(id) || group.cancellationResponsesSent.has(id))) {
+        removeRequestGroup(session, group);
+      }
+      return;
+    }
+
+    group.cleanupStarted = true;
+    for (const requestId of group.cancelledIds) session.transport.closeSSEStream(requestId);
+    for (const requestId of group.cancelledIds) {
+      if (group.cancellationResponsesSent.has(requestId)) continue;
+      try {
+        // The stream is already closed, so this releases SDK request correlation without writing after cancellation.
+        await transportSend(cancelledRequestError(requestId));
+      } catch {
+        // The SDK's public send path removes correlations before reporting that the stream is gone.
+      }
+    }
+    removeRequestGroup(session, group);
+  };
+
+  const handleSessionRequest = async (session: HttpMcpSession, req: http.IncomingMessage, res: http.ServerResponse, body?: unknown, readBody = false): Promise<void> => {
+    const isDelete = req.method === "DELETE";
+    let countedAsActive = false;
+    let reservedControlSlot = false;
+    if (!isDelete) {
+      if (session.activeRequests >= maxActiveRequestsPerSession) {
+        if (session.controlRequests > 0) {
+          writeJsonRpcError(res, 429, -32000, "This MCP session has reached its active request limit.");
+          return;
+        }
+        session.controlRequests++;
+        reservedControlSlot = true;
+      } else {
+        session.activeRequests++;
+        countedAsActive = true;
+      }
+      if (session.idleTimer) clearTimeout(session.idleTimer);
+      session.idleTimer = undefined;
+    }
+    try {
+      const payload = readBody && req.method === "POST" ? await readJsonBody(req) : body;
+      if (reservedControlSlot && !isCancellationOnlyPayload(payload)) {
+        writeJsonRpcError(res, 429, -32000, "This MCP session has reached its active request limit.");
+        return;
+      }
+      if (res.destroyed) return;
+      const requestIds = requestIdsFromBody(payload);
+      if (requestIds.some((requestId) => session.requestGroupsById.has(requestId))) {
+        writeJsonRpcError(res, 400, -32600, "A JSON-RPC request ID is already active in this MCP session.");
+        return;
+      }
+      const requestGroup: HttpMcpRequestGroup | undefined = requestIds.length > 0
+        ? {
+            response: res,
+            requestIds: new Set(requestIds),
+            cancelledIds: new Set(),
+            completedIds: new Set(),
+            cancellationResponsesSent: new Set(),
+            cleanupStarted: false,
+          }
+        : undefined;
+      if (requestGroup) {
+        session.requestGroups.add(requestGroup);
+        for (const requestId of requestGroup.requestIds) session.requestGroupsById.set(requestId, requestGroup);
+      }
+      res.once("close", () => {
+        if (res.writableFinished) {
+          if (requestGroup && [...requestGroup.requestIds].every((id) => requestGroup.completedIds.has(id) || requestGroup.cancellationResponsesSent.has(id))) {
+            removeRequestGroup(session, requestGroup);
+          }
+          return;
+        }
+        if (requestGroup) {
+          for (const requestId of requestGroup.requestIds) {
+            if (requestGroup.completedIds.has(requestId) || requestGroup.cancelledIds.has(requestId)) continue;
+            session.transport.onmessage?.({
+              jsonrpc: "2.0",
+              method: "notifications/cancelled",
+              params: { requestId, reason: "HTTP response closed" },
+            });
+          }
+          if (requestGroup.cancelledIds.size > 0) queueMicrotask(() => { void settleCancelledGroup(session, requestGroup); });
+        }
+      });
+      await session.transport.handleRequest(req, res, payload);
+      if (requestGroup && res.writableFinished && [...requestGroup.requestIds].every((id) => requestGroup.completedIds.has(id) || requestGroup.cancellationResponsesSent.has(id))) {
+        removeRequestGroup(session, requestGroup);
+      }
+    } finally {
+      if (countedAsActive) session.activeRequests = Math.max(0, session.activeRequests - 1);
+      if (reservedControlSlot) session.controlRequests = Math.max(0, session.controlRequests - 1);
+      if (!isDelete) scheduleSessionExpiry(session);
+    }
+  };
+
+  const installCancellationStreamCleanup = (session: HttpMcpSession): void => {
+    const dispatchMessage = session.transport.onmessage;
+    const dispatchSend = session.transport.send.bind(session.transport);
+    session.transport.send = async (message, options) => {
+      const result = await dispatchSend(message, options);
+      if (isJSONRPCErrorResponse(message) || isJSONRPCResultResponse(message)) {
+        const responseId = message.id;
+        if (typeof responseId === "string" || typeof responseId === "number") {
+          const group = session.requestGroupsById.get(responseId);
+          if (group) {
+            group.completedIds.add(responseId);
+            if (group.cancelledIds.size > 0) {
+              queueMicrotask(() => { void settleCancelledGroup(session, group); });
+            } else if ([...group.requestIds].every((id) => group.completedIds.has(id))) {
+              removeRequestGroup(session, group);
+            }
+          }
+        }
+      }
+      return result;
+    };
+    session.transport.onmessage = (message, extra) => {
+      dispatchMessage?.(message, extra);
+      const requestId = validatedCancellationRequestId(message);
+      if (requestId === undefined) return;
+      const group = session.requestGroupsById.get(requestId);
+      if (!group || group.completedIds.has(requestId) || group.cancelledIds.has(requestId)) return;
+      group.cancelledIds.add(requestId);
+      queueMicrotask(() => { void settleCancelledGroup(session, group); });
+    };
+  };
+
+  const handleStatelessRequest = async (req: http.IncomingMessage, res: http.ServerResponse, body: unknown): Promise<void> => {
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableDnsRebindingProtection: true,
+      maxRequestBodySize: MAX_BODY,
+      allowedHosts,
+      ...(configuredOrigins ? { allowedOrigins: configuredOrigins } : {}),
+    });
+    res.once("close", () => {
+      if (!res.writableFinished) void server.close().catch(() => undefined);
+    });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  };
+
+  const httpServer = http.createServer(async (req, res) => {
+    let url: URL;
+    try {
+      url = new URL(req.url || "/", "http://localhost");
+    } catch {
+      writeJsonRpcError(res, 400, -32700, "Invalid request target.");
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(getHealthPayload()));
+      return;
+    }
+    if (url.pathname !== "/mcp") {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Not found. Use POST /mcp for the MCP protocol or GET /health for a health check.");
+      return;
+    }
+    if (req.method !== "POST" && req.method !== "DELETE") {
+      res.writeHead(405, { "Content-Type": "application/json", Allow: "POST, DELETE" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. Use POST /mcp." }, id: null }));
+      return;
+    }
+
+    const requestHost = req.headers.host;
+    const origin = req.headers.origin;
+    if (allowedHosts.length > 0 && (!requestHost || !allowedHosts.includes(requestHost))) {
+      writeJsonRpcError(res, 403, -32000, "Invalid Host header.");
+      return;
+    }
+    if (configuredOrigins && origin && !configuredOrigins.includes(origin)) {
+      writeJsonRpcError(res, 403, -32000, "Invalid Origin header.");
+      return;
+    }
+    if (shuttingDown) {
+      writeJsonRpcError(res, 503, -32000, "MCP server is shutting down.");
+      return;
+    }
+
+    const rawSessionId = req.headers["mcp-session-id"];
+    let session: HttpMcpSession | undefined;
+    if (rawSessionId !== undefined) {
+      if (typeof rawSessionId !== "string" || !MCP_SESSION_ID_PATTERN.test(rawSessionId)) {
+        writeJsonRpcError(res, 400, -32000, "Invalid MCP session identifier.");
+        return;
+      }
+      session = sessions.get(rawSessionId);
+      if (!session || session.closed) {
+        writeJsonRpcError(res, 404, -32001, "Session not found.");
+        return;
+      }
+    }
+
+    try {
+      if (req.method === "DELETE") {
+        if (!session) {
+          res.writeHead(405, { "Content-Type": "application/json", Allow: "POST, DELETE" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "A session identifier is required." }, id: null }));
+          return;
+        }
+        await handleSessionRequest(session, req, res);
+        return;
+      }
+
+      if (session) {
+        await handleSessionRequest(session, req, res, undefined, true);
+        return;
+      }
+      const body = await readJsonBody(req);
+      if (isInitializeBody(body)) {
+        if (shuttingDown || sessions.size + pendingSessionInitializations >= maxSessions) {
+          writeJsonRpcError(res, 503, -32000, "MCP session capacity is temporarily full.");
+          return;
+        }
+        pendingSessionInitializations++;
+        const newSession = createStatefulSession();
+        try {
+          await newSession.server.connect(newSession.transport);
+          installCancellationStreamCleanup(newSession);
+          await handleSessionRequest(newSession, req, res, body);
+        } finally {
+          if (newSession.reservationHeld) {
+            pendingSessionInitializations = Math.max(0, pendingSessionInitializations - 1);
+            newSession.reservationHeld = false;
+          }
+          if (!newSession.id && !newSession.closed) await disposeSession(newSession);
+        }
+        return;
+      }
+      await handleStatelessRequest(req, res, body);
+    } catch (error) {
+      const inputError = error instanceof HttpInputError ? error : undefined;
+      if (!inputError) console.error("[hh-mcp] HTTP request failed.");
+      writeJsonRpcError(res, inputError?.status ?? 500,
+        inputError?.status === 400 ? -32700 : inputError?.status === 413 ? -32000 : -32603,
+        inputError?.message ?? "Internal server error");
+    }
+  });
+
+  const closeSessions = async (): Promise<void> => {
+    shuttingDown = true;
+    await Promise.all([...trackedSessions].map((session) => disposeSession(session)));
+  };
+  httpSessionClosers.set(httpServer, closeSessions);
+  httpServer.once("close", () => { void closeSessions(); });
+  return httpServer;
+}
+
 // --- Start ---
 
 async function main() {
@@ -818,8 +1277,6 @@ async function main() {
 
   if (httpMode) {
     const host = process.env.HOST || "127.0.0.1";
-    // DNS-rebinding protection (off by default in the SDK, CVE-2025-66414):
-    // only accept requests whose Host header is in this allow-list.
     const allowedHosts = (
       process.env.HH_ALLOWED_HOSTS ||
       `127.0.0.1:${port},localhost:${port}`
@@ -830,74 +1287,7 @@ async function main() {
     const allowedOrigins = process.env.HH_ALLOWED_ORIGINS
       ? process.env.HH_ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean)
       : undefined;
-
-    const httpServer = http.createServer(async (req, res) => {
-      const url = new URL(req.url || "/", `http://${req.headers.host || `${host}:${port}`}`);
-
-      if (req.method === "GET" && url.pathname === "/health") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(getHealthPayload()));
-        return;
-      }
-
-      if (url.pathname === "/mcp") {
-        if (req.method !== "POST") {
-          res.writeHead(405, { "Content-Type": "application/json", Allow: "POST" });
-          res.end(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              error: { code: -32000, message: "Method not allowed. Use POST /mcp." },
-              id: null,
-            }),
-          );
-          return;
-        }
-        // Stateless: a fresh server + transport per request avoids the
-        // single-shared-transport concurrency bug. Torn down on response close.
-        const server = createServer();
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-          enableDnsRebindingProtection: true,
-          maxRequestBodySize: MAX_BODY,
-          allowedHosts,
-          ...(allowedOrigins ? { allowedOrigins } : {}),
-        });
-        res.on("close", () => {
-          transport.close();
-          server.close();
-        });
-        try {
-          await server.connect(transport);
-          const body = await readJsonBody(req);
-          await transport.handleRequest(req, res, body);
-        } catch (err) {
-          const inputError = err instanceof HttpInputError ? err : undefined;
-          if (!inputError) console.error("[hh-mcp] HTTP request failed.");
-          if (!res.headersSent) {
-            const status = inputError?.status ?? 500;
-            res.writeHead(status, {
-              "Content-Type": "application/json",
-              ...(status === 413 ? { Connection: "close" } : {}),
-            });
-            res.end(
-              JSON.stringify({
-                jsonrpc: "2.0",
-                error: {
-                  code: inputError?.status === 400 ? -32700 : inputError?.status === 413 ? -32000 : -32603,
-                  message: inputError?.message ?? "Internal server error",
-                },
-                id: null,
-              }),
-              () => { if (status === 413) req.destroy(); },
-            );
-          }
-        }
-        return;
-      }
-
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Not found. Use POST /mcp for the MCP protocol or GET /health for a health check.");
-    });
+    const httpServer = createHttpServer({ port, allowedHosts, allowedOrigins });
 
     httpServer.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
@@ -917,7 +1307,9 @@ async function main() {
       );
     });
 
-    const shutdown = () => httpServer.close(() => process.exit(0));
+    const shutdown = () => {
+      void closeHttpMcpSessions(httpServer).finally(() => httpServer.close(() => process.exit(0)));
+    };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
   } else {

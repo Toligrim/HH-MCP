@@ -208,6 +208,47 @@ describe("post filters", () => {
     }
   });
 
+  it("keeps denied non-target schedules and formats unknown in every filter mode", () => {
+    const cases: Array<{ vacancy: Record<string, unknown>; rule: { rule: "work_schedule_by_days" | "work_format"; value: string } }> = [
+      { vacancy: { work_schedule_by_days: "THREE_ON_THREE_OFF", description: "График не 3/3." }, rule: { rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" } },
+      { vacancy: { work_schedule_by_days: "FIVE_ON_TWO_OFF", description: "Schedule 5/2 is not offered." }, rule: { rule: "work_schedule_by_days", value: "FOUR_ON_FOUR_OFF" } },
+      { vacancy: { work_schedule_by_days: "FLEXIBLE", description: "Гибкий график не доступен." }, rule: { rule: "work_schedule_by_days", value: "OTHER" } },
+      { vacancy: { work_schedule_by_days: "WEEKEND", description: "Weekend schedule is unavailable." }, rule: { rule: "work_schedule_by_days", value: "FLEXIBLE" } },
+      { vacancy: { description: "График не 3/3." }, rule: { rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" } },
+      { vacancy: { description: "Schedule 5/2 is not offered." }, rule: { rule: "work_schedule_by_days", value: "FOUR_ON_FOUR_OFF" } },
+      { vacancy: { description: "Гибкий график не доступен." }, rule: { rule: "work_schedule_by_days", value: "OTHER" } },
+      { vacancy: { description: "Weekend schedule is unavailable." }, rule: { rule: "work_schedule_by_days", value: "FLEXIBLE" } },
+    ];
+    const denials: Record<string, [string, string]> = {
+      REMOTE: ["Удалённая работа не предлагается.", "Remote work is not available."],
+      HYBRID: ["Гибридный формат не предлагается.", "Hybrid work is not available."],
+      FIELD_WORK: ["Разъездной формат работы не предлагается.", "Field work is not available."],
+      ON_SITE: ["Работа на месте работодателя не предлагается.", "Onsite work is not available."],
+    };
+    for (const [index, id] of formatIds.entries()) {
+      const wanted = formatIds[(index + 1) % formatIds.length]!;
+      for (const description of denials[id]!) {
+        cases.push({ vacancy: { work_format: id, description }, rule: { rule: "work_format", value: wanted } });
+        cases.push({ vacancy: { description }, rule: { rule: "work_format", value: wanted } });
+      }
+    }
+
+    for (const { vacancy, rule } of cases) {
+      const strict = evaluatePostFilters(vacancy, [rule], "strict");
+      const inclusive = evaluatePostFilters(vacancy, [rule], "inclusive");
+      const review = evaluatePostFilters(vacancy, [rule], "review");
+      expect(strict.rules[0]?.state, JSON.stringify({ vacancy, rule })).toBe("unknown");
+      expect(inclusive.rules[0]?.state, JSON.stringify({ vacancy, rule })).toBe("unknown");
+      expect(review.rules[0]?.state, JSON.stringify({ vacancy, rule })).toBe("unknown");
+      expect(strict.decision).toBe("exclude");
+      expect(inclusive.decision).toBe("keep");
+      expect(review.decision).toBe("review");
+    }
+
+    expect(evaluatePostFilters({ work_schedule_by_days: "FIVE_ON_TWO_OFF", description: "Schedule 5/2." }, [{ rule: "work_schedule_by_days", value: "FOUR_ON_FOUR_OFF" }], "review").rules[0]?.state).toBe("no_match");
+    expect(evaluatePostFilters({ work_format: "HYBRID", description: "Hybrid work." }, [{ rule: "work_format", value: "ON_SITE" }], "review").rules[0]?.state).toBe("no_match");
+  });
+
   it("applies strict, inclusive and review decision policies", () => {
     const rules = [{ rule: "night_shifts", value: false }] as const;
     expect(evaluatePostFilters({}, [...rules], "strict").decision).toBe("exclude");
