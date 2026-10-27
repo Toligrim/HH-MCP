@@ -1,6 +1,6 @@
 # PR 2 Review Fixes Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Address the owner's independent-review findings in existing PR #2 with verified security, completeness, structured-filter and performance fixes.
 
@@ -33,11 +33,11 @@
 
 **Interfaces:** Preserve `createServer()`, tool schemas and Streamable HTTP; provide exported internal input-limit constants/helper only if needed for shared protection/tests.
 
-- [ ] Confirm GHSA-46jr-4wx8-v453 against installed code and current official advisory; inspect current SDK/Zod/runtime advisories and package engines.
-- [ ] Add a bounded failing regression for element count, deep nesting and HTTP size; use actual SDK transport. Demonstrate zero handler/HH calls on rejection.
-- [ ] Upgrade to a compatible safe SDK 1.x release >=1.32.0, enable its documented `maxToolInputElements`, justify a reduced HTTP-body limit from actual tool schemas (target 256 KiB unless inspection warrants a different bound), and protect depth before recursive validation. Review direct Zod and runtime transitives; make only evidenced compatible upgrades.
-- [ ] Test normal initialize/list/call, raw/scalar compatibility, schema publication/validation, cancellation, oversized arrays, deep nested objects and malformed/oversize HTTP bodies. Use local ephemeral HTTP only, never production.
-- [ ] Run focused tests, typecheck/lint, dependency audit with sanitized reporting. Commit exact scoped files and write task report with versions, limits, sources, red/green evidence and remaining advisories.
+- [x] Confirm GHSA-46jr-4wx8-v453 against installed code and current official advisory; inspect current SDK/Zod/runtime advisories and package engines.
+- [x] Add a bounded failing regression for element count, deep nesting and HTTP size; use actual SDK transport. Demonstrate zero handler/HH calls on rejection.
+- [x] Upgrade to a compatible safe SDK 1.x release >=1.32.0, enable its documented `maxToolInputElements`, justify a reduced HTTP-body limit from actual tool schemas (target 256 KiB unless inspection warrants a different bound), and protect depth before recursive validation. Review direct Zod and runtime transitives; make only evidenced compatible upgrades.
+- [x] Test normal initialize/list/call, raw/scalar compatibility, schema publication/validation, cancellation, oversized arrays, deep nested objects and malformed/oversize HTTP bodies. Use local ephemeral HTTP only, never production.
+- [x] Run focused tests, typecheck/lint, dependency audit with sanitized reporting. Commit exact scoped files and write task report with versions, limits, sources, red/green evidence and remaining advisories.
 
 ### Task 2: Structured schedule and work-format postfilters
 
@@ -45,11 +45,11 @@
 
 **Interfaces:** Preserve `evaluatePostFilters`, `postFilterSchema`, rule names and match/no_match/unknown. Use existing official dictionary catalogue as the single supported-ID set; no automatic network fetch in filter evaluation.
 
-- [ ] Reproduce failures for `THREE_ON_THREE_OFF`, `ONE_ON_THREE_OFF`, `ON_SITE`, `FIELD_WORK`, and unknown requested schedule.
-- [ ] Normalize exact supported IDs independently from bounded display aliases and description heuristics. Cover all current 14 schedule IDs and 4 work formats. Preserve legacy aliases 2/2, 5/2, remote/office; never merge ON_SITE and FIELD_WORK.
-- [ ] Known structured arrays represent supported alternatives: a requested member may match. Missing/empty fields use conservative description evidence; unknown/malformed values, conflicting ID/name or description remain unknown. An unknown requested value is always unknown.
-- [ ] Add parameterized tests for every structured ID (string and `{id,name}`), missing/empty fields, future IDs, multi-value arrays, work-format separation, description contradictions and existing RU/EN negations. Do not let descriptive regex override unknown structured IDs.
-- [ ] Run focused filters and MCP regression tests, typecheck/lint; commit scoped files, report red/green evidence and official source/date.
+- [x] Reproduce failures for `THREE_ON_THREE_OFF`, `ONE_ON_THREE_OFF`, `ON_SITE`, `FIELD_WORK`, and unknown requested schedule.
+- [x] Normalize exact supported IDs independently from bounded display aliases and description heuristics. Cover all current 14 schedule IDs and 4 work formats. Preserve legacy aliases 2/2, 5/2, remote/office; never merge ON_SITE and FIELD_WORK.
+- [x] Known structured arrays represent supported alternatives: a requested member may match. Missing/empty fields use conservative description evidence; unknown/malformed values, conflicting ID/name or description remain unknown. An unknown requested value is always unknown.
+- [x] Add parameterized tests for every structured ID (string and `{id,name}`), missing/empty fields, future IDs, multi-value arrays, work-format separation, description contradictions and existing RU/EN negations. Do not let descriptive regex override unknown structured IDs.
+- [x] Run focused filters and MCP regression tests, typecheck/lint; commit scoped files, report red/green evidence and official source/date.
 
 ### Task 3: Collector completeness and measured performance
 
@@ -57,17 +57,17 @@
 
 **Interfaces:** Preserve `collectSearch`, manifest and checkpoint interfaces; additive optional coverage fields are allowed. Keep checkpoint v1 compatibility conservatively; do not silently declare old/inconsistent completed coverage trustworthy.
 
-- [ ] Before edits record same-harness baseline for 5,000 and 20,000 synthetic jobs: elapsed, process maxRSS, serialized checkpoint bytes, dataset/options/sample count. No real HH. Preserve harness for after measurement.
-- [ ] Add failing regressions for found150/150 unique COMPLETE versus found150/145 unique PARTIAL, legitimate child overlap, changing index, and checkpoint/resume after missing coverage. Confirm current linear ID lookup and page clone costs.
-- [ ] Maintain per-terminal-partition unique IDs, duplicates and expected-count observations. At completion detect unique-count mismatch and report bounded diagnostic gaps; mutable-index warnings remain. A stable duplicate deficit can never become COMPLETE on resume. Ignore parent probe overlap when judging leaf completeness.
-- [ ] Replace global linear lookup with a per-run Map reconstructed on resume. Replace full per-page item clones with page-sized undo records restoring modified metadata/provenance and appended rows if state exceeds 32 MiB. Keep checkpoint snapshots private when handed to callbacks; full serialization/persistence costs remain explicit.
-- [ ] Test rollback with pre-existing hits/provenance plus new IDs, invalid or old coverage state, index drift both directions, 32 MiB boundary, and CLI persistence/resume. Verify 5,000/20,000 load cases in the common test set without fragile speed assertions.
-- [ ] Re-run identical benchmark after changes in isolated processes and report actual times/maxRSS/bytes, not an assumed speedup. Run focused tests/typecheck/lint, commit scoped files and report.
+- [x] Before edits record same-harness baseline for 5,000 and 20,000 synthetic jobs: elapsed, process maxRSS, serialized checkpoint bytes, dataset/options/sample count. No real HH. Preserve harness for after measurement.
+- [x] Add failing regressions for found150/150 unique COMPLETE versus found150/145 unique PARTIAL, legitimate child overlap, changing index, and checkpoint/resume after missing coverage. Confirm current linear ID lookup and page clone costs.
+- [x] Maintain per-terminal-partition unique IDs, duplicates and expected-count observations. At completion detect unique-count mismatch and report bounded diagnostic gaps; mutable-index warnings remain. A stable duplicate deficit can never become COMPLETE on resume. Ignore parent probe overlap when judging leaf completeness.
+- [x] Replace global linear lookup with a per-run Map reconstructed on resume. Replace full per-page item clones with page-sized undo records restoring modified metadata/provenance and appended rows if state exceeds 32 MiB. Keep checkpoint snapshots private when handed to callbacks; full serialization/persistence costs remain explicit.
+- [x] Test rollback with pre-existing hits/provenance plus new IDs, invalid or old coverage state, index drift both directions, 32 MiB boundary, and CLI persistence/resume. Verify 5,000/20,000 load cases in the common test set without fragile speed assertions.
+- [x] Re-run identical benchmark after changes in isolated processes and report actual times/maxRSS/bytes, not an assumed speedup. Run focused tests/typecheck/lint, commit scoped files and report.
 
 ## Final validation and publication
 
-- [ ] Run `npm ci`, `npm run typecheck`, `npm run lint`, `npm test`, `npm run build`, `git diff --check`; audit runtime and full tree, listing remaining advisories and any audit-service failure accurately.
-- [ ] Validate updated SDK transport/input limits and CLI checkpoint/resume with compiled runtime where unit coverage does not suffice. No mass/live production probes.
-- [ ] Update `candidate-source/docs/issue-1-verification.md` and relevant operator limits, recording real results and historical evidence separately.
+- [x] Run `npm ci`, `npm run typecheck`, `npm run lint`, `npm test`, `npm run build`, `git diff --check`; audit runtime and full tree, listing remaining advisories and any audit-service failure accurately.
+- [x] Validate updated SDK transport/input limits and CLI checkpoint/resume with compiled runtime where unit coverage does not suffice. No mass/live production probes.
+- [x] Update `candidate-source/docs/issue-1-verification.md` and relevant operator limits, recording real results and historical evidence separately.
 - [ ] Commit and push to the same feature branch. Fetch live PR exact HEAD and independently review actual diff from base; fix confirmed findings in the same branch and re-review the new HEAD.
 - [ ] Update existing PR body with final SHA/evidence; keep draft. Confirm protected paths/base unchanged, clean tree, MERGE:NO and DEPLOY:NO.
