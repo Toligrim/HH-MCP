@@ -65,6 +65,22 @@ function canonicalSchedule(value: string): string | undefined {
       "5/2": "FIVE_ON_TWO_OFF", fiveontwooff: "FIVE_ON_TWO_OFF", пятьчерездва: "FIVE_ON_TWO_OFF" } as Record<string, string>)[normalized];
 }
 
+function schedulePattern(id: string): string | undefined {
+  const numeric = scheduleLabels[id];
+  if (/^\d\/\d$/.test(numeric ?? "")) return (numeric ?? "").replace("/", "\\s*[/\\-]\\s*");
+  if (id === "WEEKEND") return "(?:weekends?(?:\\s+schedule)?|(?:работа\\s+)?по\\s+выходным|выходн[а-яё]*\\s+(?:график|работа))";
+  if (id === "FLEXIBLE") return "(?:flexible\\s+(?:work\\s+)?schedule|гибк[а-яё]*\\s+(?:график|расписание)|свободн[а-яё]*\\s+(?:график|расписание))";
+  if (id === "OTHER") return "(?:other\\s+(?:work\\s+)?schedule|(?:другой|иной)\\s+(?:график|режим|расписание)|другое\\s+(?:расписание|график))";
+  return undefined;
+}
+
+function schedulesInDescription(value: string): string[] {
+  return clauses(value).flatMap((part) => [...scheduleIds].filter((id) => {
+    const pattern = schedulePattern(id);
+    return pattern ? new RegExp(pattern, "iu").test(part) : false;
+  }));
+}
+
 function formatKind(value: string): "remote" | "hybrid" | "office" | "field" | undefined {
   if (formatIds.has(value)) return value === "REMOTE" ? "remote" : value === "HYBRID" ? "hybrid" : value === "ON_SITE" ? "office" : "field";
   const normalized = value.toLocaleLowerCase("ru");
@@ -92,7 +108,8 @@ function formatDenied(kind: NonNullable<ReturnType<typeof formatKind>>, clause: 
       : kind === "field" ? "(?:field\\s*work|разъезд[а-яё]*)"
         : "(?:office|офис[а-яё]*|onsite|on-site|on\\s+site|на\\s+месте\\s+работодател[а-яё]*)";
   const denial = "(?:not\\s+(?:available|offered|allowed|provided|possible)|unavailable|isn't\\s+(?:available|offered)|не\\s+(?:доступ[а-яё]*|предусмотр[а-яё]*|предлага[а-яё]*|разреш[а-яё]*)|недоступ[а-яё]*|непредусмотр[а-яё]*|непредлага[а-яё]*|нельзя)";
-  return new RegExp(`(?:no\\s+${term}.{0,60}|${term}.{0,60}(?:${denial})|(?:${denial}).{0,60}${term})`, "iu").test(clause);
+  const formatContext = "(?:work|format|position|option|arrangement|работ[аы]|формат|позици[яи]|вариант)";
+  return new RegExp(`(?:no\\s+${term}\\s+${formatContext}|${term}.{0,25}${formatContext}.{0,30}(?:${denial})|${term}\\s+(?:is\\s+)?(?:${denial})|(?:${denial}).{0,30}${term})`, "iu").test(clause);
 }
 
 type StructuredValue = { id?: string; name?: string; valid: boolean };
@@ -147,11 +164,12 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
       || /(?:\bno\s+remote\b|\bremote\s+(?:work|work\s+format)\s+(?:is\s+)?(?:not\s+available|unavailable|not\s+offered|not\s+allowed)|не\s+(?:предусмотрена\s+)?удал[её]н|удал[её]н\w*.{0,30}не\s+(?:доступ|предусмотр|разреш))/i.test(part));
     const mandatoryOffice = descClauses.some((part) => /(?:mandatory|обязательн|требуется).{0,45}(?:office|офис)|(?:office|офис).{0,45}(?:mandatory|required|обязательн)/i.test(part));
     const descriptionKinds = descClauses.flatMap((part) => {
-      if (/(?:remote\s+(?:work|position|format)|work\s+remotely|удал[её]н(?:ная)?\s+(?:работа|формат)|работа\s+(?:удал[её]нно|дистанционно))/i.test(part)) return ["remote" as const];
-      if (/(?:hybrid\s+(?:work|format)|гибридн\w*\s+(?:формат|работа))/i.test(part)) return ["hybrid" as const];
-      if (/(?:field\s*work|разъездн[а-яё]*\s+(?:формат|работа|характер)|работа\s+разъездн[а-яё]*)/i.test(part)) return ["field" as const];
-      if (/(?:office[- ]based|onsite\s+(?:work|position)|work\s+from\s+(?:the\s+)?office|работа\s+в\s+офисе|офисный\s+формат|обязательное\s+присутствие\s+в\s+офисе)/i.test(part)) return ["office" as const];
-      return [];
+      const kinds: Array<"remote" | "hybrid" | "field" | "office"> = [];
+      if (/(?:remote\s+(?:work|position|format)|work\s+remotely|удал[её]н[а-яё]*\s+(?:работа|формат|или)|работа\s+(?:удал[её]нно|дистанционно))/iu.test(part)) kinds.push("remote");
+      if (/(?:hybrid\s+(?:work|format)|гибридн[а-яё]*\s+(?:формат|работа))/iu.test(part)) kinds.push("hybrid");
+      if (/(?:field\s*work|разъездн[а-яё]*\s+(?:формат|работа|характер)|работа\s+разъездн[а-яё]*)/iu.test(part)) kinds.push("field");
+      if (/(?:office[- ]based|onsite\s+(?:work|position)|work\s+from\s+(?:the\s+)?office|работа\s+в\s+офисе|офисный\s+формат|обязательное\s+присутствие\s+в\s+офисе)/iu.test(part)) kinds.push("office");
+      return kinds;
     });
     const evidenced = [...new Set([...structuredKinds, ...descriptionKinds])];
     if (remoteDenied && (structuredKinds.includes("remote") || descriptionKinds.includes("remote"))) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
@@ -169,7 +187,7 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
     if (!wanted || !scheduleIds.has(wanted)) return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: "Unknown requested schedule" };
     const wantedPattern = wanted === "TWO_ON_TWO_OFF" ? "(?:2\\s*[/\\-]\\s*2|two\\s+on\\s+two\\s+off|2\\s+через\\s+2|два\\s+через\\s+два)"
       : wanted === "FIVE_ON_TWO_OFF" ? "(?:5\\s*[/\\-]\\s*2|five\\s+on\\s+two\\s+off|5\\s+через\\s+2|пять\\s+через\\s+два)"
-        : /^\d\/\d$/.test(scheduleLabels[wanted] ?? "") ? (scheduleLabels[wanted] ?? "").replace("/", "\\s*[/\\-]\\s*") : undefined;
+        : schedulePattern(wanted);
     const negatedWanted = wantedPattern && clauses(description).some((part) => {
       const negatedBefore = new RegExp(`(?:\\b(?:not|do not|does not|don't|doesn't)(?:\\s+(?:work|offer|use|follow|schedule)){0,3}\\s+|\\bno\\s+|не\\s+(?:работаем\\s+)?)(?:schedule\\s+)?${wantedPattern}`, "iu");
       const negatedAfter = new RegExp(`${wantedPattern}\\s+(?:(?:is|was)\\s+)?(?:not\\s+(?:offered|available|used|followed)|isn't\\s+(?:offered|available)|не\\s+(?:предлагается|доступен|используется))`, "iu");
@@ -192,20 +210,17 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
         actual.push(entry.id);
       }
       const descriptionConflict = clauses(description).some((part) => {
-        const numeric = part.match(/\b(\d\s*(?:\/|-)\s*\d)\b/);
-        const described = numeric ? canonicalSchedule(numeric[1]!.replace(/\s/g, "")) : undefined;
-        return described !== undefined && !actual.includes(described);
+        const described = [...scheduleIds].filter((id) => {
+          const pattern = schedulePattern(id);
+          return pattern ? new RegExp(pattern, "iu").test(part) : false;
+        });
+        return described.some((id) => !actual.includes(id));
       });
       if (descriptionConflict) return { state: "unknown", confidence: 0, source: "work_schedule_by_days,description", evidence: excerpt(description) };
       const match = actual.includes(wanted);
       return { state: match ? "match" : "no_match", confidence: 0.95, source: "work_schedule_by_days", evidence: excerpt(values.join(", ")) };
     }
-    const scheduleAliases = clauses(description).flatMap((part) => {
-      const numeric = part.match(/\b(\d\s*(?:\/|-)\s*\d)\b/);
-      if (numeric) return [canonicalSchedule(numeric[1]!.replace(/\s/g, ""))].filter((value): value is string => value !== undefined);
-      if (/пятиднев\w*/i.test(part)) return ["FIVE_ON_TWO_OFF"];
-      return [];
-    });
+    const scheduleAliases = schedulesInDescription(description).concat(/пятиднев[а-яё]*/iu.test(description) ? ["FIVE_ON_TWO_OFF"] : []);
     if (!scheduleAliases.length) return { state: "unknown", confidence: 0, source: "description", evidence: excerpt(description || "No schedule evidence") };
     return { state: scheduleAliases.includes(wanted) ? "match" : "no_match", confidence: 0.7, source: "description", evidence: excerpt(description) };
   }

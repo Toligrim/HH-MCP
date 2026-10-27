@@ -167,6 +167,29 @@ describe("post filters", () => {
     }
   });
 
+  it("does not mistake a negated format-related qualification for a format denial", () => {
+    const rule = { rule: "work_format", value: "HYBRID" } as const;
+    const description = "No hybrid experience required; hybrid work is available.";
+    expect(evaluatePostFilters({ description }, [rule], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ work_format: [{ id: "HYBRID" }], description }, [rule], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ description: "Гибридный опыт не требуется; гибридный формат доступен." }, [rule], "review").rules[0]?.state).toBe("match");
+  });
+
+  it("detects contradictions for nonnumeric supported schedules", () => {
+    const cases = [
+      { id: "WEEKEND", denied: "Работа по выходным не предлагается.", affirmative: "Работа по выходным." },
+      { id: "FLEXIBLE", denied: "Flexible schedule is not available.", affirmative: "Flexible schedule." },
+      { id: "OTHER", denied: "Other schedule is not available.", affirmative: "Other schedule." },
+    ];
+    for (const { id, denied, affirmative } of cases) {
+      const rule = { rule: "work_schedule_by_days", value: id } as const;
+      expect(evaluatePostFilters({ work_schedule_by_days: [{ id }], description: denied }, [rule], "review").rules[0]?.state, `structured ${id}`).toBe("unknown");
+      expect(evaluatePostFilters({ description: denied }, [rule], "review").rules[0]?.state, `description ${id}`).toBe("unknown");
+      expect(evaluatePostFilters({ work_schedule_by_days: [{ id }], description: affirmative }, [rule], "review").rules[0]?.state, `structured affirmative ${id}`).toBe("match");
+      expect(evaluatePostFilters({ description: affirmative }, [rule], "review").rules[0]?.state, `description affirmative ${id}`).toBe("match");
+    }
+  });
+
   it("applies strict, inclusive and review decision policies", () => {
     const rules = [{ rule: "night_shifts", value: false }] as const;
     expect(evaluatePostFilters({}, [...rules], "strict").decision).toBe("exclude");
