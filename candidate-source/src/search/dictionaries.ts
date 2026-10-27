@@ -20,6 +20,9 @@ const seed: Record<string, string[]> = {
   driver_license_types: ["A", "B", "C", "D", "E", "BE", "CE", "DE", "TM", "TB"],
 };
 const catalogueIds = new Map(Object.entries(seed).map(([name, ids]) => [name, new Set(ids)]));
+export function getSearchDictionaryIds(dictionary: string): string[] {
+  return [...(catalogueIds.get(dictionary) ?? [])];
+}
 const TTL_MS = 60 * 60 * 1000;
 const MAX_CATALOGUES = 8;
 type Entry = { items: DictionaryItem[]; updated_at: number; loaded_at: number };

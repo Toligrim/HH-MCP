@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import { evaluatePostFilters, postFilterSchema } from "../filters.js";
 
 describe("post filters", () => {
+  const scheduleIds = [
+    "SIX_ON_ONE_OFF", "FIVE_ON_TWO_OFF", "FOUR_ON_FOUR_OFF", "FOUR_ON_THREE_OFF",
+    "FOUR_ON_TWO_OFF", "THREE_ON_THREE_OFF", "THREE_ON_TWO_OFF", "TWO_ON_TWO_OFF",
+    "TWO_ON_ONE_OFF", "ONE_ON_THREE_OFF", "ONE_ON_TWO_OFF", "WEEKEND", "FLEXIBLE", "OTHER",
+  ];
+  const formatIds = ["ON_SITE", "REMOTE", "HYBRID", "FIELD_WORK"];
+
   it("requires strict discriminated rules and bounds their count", () => {
     expect(postFilterSchema.safeParse({ rule: "night_shifts", value: false }).success).toBe(true);
     expect(postFilterSchema.safeParse({ rule: "night_shifts", value: "no" }).success).toBe(false);
@@ -69,6 +76,51 @@ describe("post filters", () => {
     expect(evaluatePostFilters({ description: "Python is not mandatory and Linux is required" }, [rule], "strict").rules[0]?.state).not.toBe("match");
     expect(evaluatePostFilters({ description: "Python is discussed while excellent communication is required" }, [rule], "strict").rules[0]?.state).not.toBe("match");
     expect(evaluatePostFilters({ description: "Требуется Windows или Linux" }, [{ rule: "required_technology", value: "Linux" }], "strict").rules[0]?.state).not.toBe("match");
+  });
+
+  it("matches every official structured schedule ID as a string or {id,name}", () => {
+    for (const id of scheduleIds) {
+      const rule = { rule: "work_schedule_by_days", value: id } as const;
+      expect(evaluatePostFilters({ work_schedule_by_days: id }, [rule], "review").rules[0]?.state, id).toBe("match");
+      expect(evaluatePostFilters({ work_schedule_by_days: [{ id, name: id }] }, [rule], "review").rules[0]?.state, id).toBe("match");
+    }
+  });
+
+  it("matches every official structured work format ID without merging on-site and field work", () => {
+    const names: Record<string, string> = { ON_SITE: "На месте работодателя", REMOTE: "Удалённо", HYBRID: "Гибрид", FIELD_WORK: "Разъездной" };
+    for (const id of formatIds) {
+      const rule = { rule: "work_format", value: id } as const;
+      expect(evaluatePostFilters({ work_format: id }, [rule], "review").rules[0]?.state, id).toBe("match");
+      expect(evaluatePostFilters({ work_format: [{ id, name: names[id] }] }, [rule], "review").rules[0]?.state, id).toBe("match");
+    }
+    expect(evaluatePostFilters({ work_format: [{ id: "FIELD_WORK" }] }, [{ rule: "work_format", value: "ON_SITE" }], "review").rules[0]?.state).toBe("no_match");
+    expect(evaluatePostFilters({ work_format: [{ id: "ON_SITE" }] }, [{ rule: "work_format", value: "FIELD_WORK" }], "review").rules[0]?.state).toBe("no_match");
+  });
+
+  it("keeps unknown requested or actual structured IDs unknown and accepts known alternatives", () => {
+    expect(evaluatePostFilters({ work_schedule_by_days: "THREE_ON_THREE_OFF", description: "Работа 3/3" }, [{ rule: "work_schedule_by_days", value: "FUTURE_SCHEDULE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_schedule_by_days: [{ id: "FUTURE_SCHEDULE", name: "2/2" }], description: "Работа 2/2" }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: [{ id: "FUTURE_FORMAT", name: "Remote" }], description: "Remote work" }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: "REMOTE" }, [{ rule: "work_format", value: "FUTURE_REMOTE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_schedule_by_days: ["FIVE_ON_TWO_OFF", "TWO_ON_TWO_OFF"] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ work_schedule_by_days: ["TWO_ON_TWO_OFF", "FUTURE_SCHEDULE"] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: ["REMOTE", "HYBRID"] }, [{ rule: "work_format", value: "HYBRID" }], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ work_format: ["REMOTE", "FUTURE_FORMAT"] }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_schedule_by_days: [] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: [] }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: [{ name: "Remote" }] }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("unknown");
+  });
+
+  it("keeps structured ID/name and description contradictions unknown while allowing missing-field heuristics", () => {
+    expect(evaluatePostFilters({ work_schedule_by_days: [{ id: "TWO_ON_TWO_OFF", name: "5/2" }] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_schedule_by_days: [{ id: "TWO_ON_TWO_OFF", name: "Индивидуально" }] }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ work_format: [{ id: "ON_SITE", name: "Удалённо" }] }, [{ rule: "work_format", value: "ON_SITE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: [{ id: "REMOTE", name: "Индивидуально" }] }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ work_schedule_by_days: "TWO_ON_TWO_OFF", description: "График 5/2" }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ work_format: "REMOTE", description: "Работа в офисе" }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("unknown");
+    expect(evaluatePostFilters({ description: "График работы 2/2" }, [{ rule: "work_schedule_by_days", value: "TWO_ON_TWO_OFF" }], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ description: "Remote work" }, [{ rule: "work_format", value: "REMOTE" }], "review").rules[0]?.state).toBe("match");
+    expect(evaluatePostFilters({ description: "Разъездной характер работы" }, [{ rule: "work_format", value: "FIELD_WORK" }], "review").rules[0]?.state).toBe("match");
   });
 
   it("applies strict, inclusive and review decision policies", () => {

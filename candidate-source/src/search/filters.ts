@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { getSearchDictionaryIds } from "./dictionaries.js";
 
 const boundedValue = z.string().trim().min(1).max(80).refine((value) => !/[<>]/.test(value) && ![...value].some((character) => character.charCodeAt(0) < 32), "value must be plain bounded text");
 
@@ -46,19 +47,56 @@ function clauses(value: string): string[] {
   return value.split(/[.!?;,\n]|(?<!\p{L})(?:но|but|and|а|while|whereas)(?!\p{L})|при\s+этом|в\s+то\s+время\s+как/giu).map((part) => part.trim()).filter(Boolean);
 }
 
+const scheduleIds = new Set(getSearchDictionaryIds("work_schedule_by_days"));
+const formatIds = new Set(getSearchDictionaryIds("work_format"));
+const scheduleLabels: Record<string, string> = {
+  SIX_ON_ONE_OFF: "6/1", FIVE_ON_TWO_OFF: "5/2", FOUR_ON_FOUR_OFF: "4/4", FOUR_ON_THREE_OFF: "4/3",
+  FOUR_ON_TWO_OFF: "4/2", THREE_ON_THREE_OFF: "3/3", THREE_ON_TWO_OFF: "3/2", TWO_ON_TWO_OFF: "2/2",
+  TWO_ON_ONE_OFF: "2/1", ONE_ON_THREE_OFF: "1/3", ONE_ON_TWO_OFF: "1/2",
+  WEEKEND: "По выходным", FLEXIBLE: "Свободный", OTHER: "Другое",
+};
+const scheduleLabelIds = new Map(Object.entries(scheduleLabels).map(([id, label]) => [label.toLocaleLowerCase("ru"), id]));
 function canonicalSchedule(value: string): string | undefined {
+  if (scheduleIds.has(value)) return value;
   const normalized = value.toLocaleLowerCase("ru").replace(/[_\s-]+/g, "");
-  if (["2/2", "twoontwooff", "2через2", "двачерездва"].includes(normalized)) return "TWO_ON_TWO_OFF";
-  if (["5/2", "fiveontwooff", "пятьчерездва"].includes(normalized)) return "FIVE_ON_TWO_OFF";
-  return undefined;
+  const compactLabels = new Map([...scheduleLabelIds].map(([label, id]) => [label.replace(/\s/g, ""), id]));
+  return compactLabels.get(normalized) ?? scheduleLabelIds.get(value.toLocaleLowerCase("ru")) ??
+    ({ "2/2": "TWO_ON_TWO_OFF", twoontwooff: "TWO_ON_TWO_OFF", "2через2": "TWO_ON_TWO_OFF", двачерездва: "TWO_ON_TWO_OFF",
+      "5/2": "FIVE_ON_TWO_OFF", fiveontwooff: "FIVE_ON_TWO_OFF", пятьчерездва: "FIVE_ON_TWO_OFF" } as Record<string, string>)[normalized];
 }
 
-function formatKind(value: string): "remote" | "hybrid" | "office" | undefined {
+function formatKind(value: string): "remote" | "hybrid" | "office" | "field" | undefined {
+  if (formatIds.has(value)) return value === "REMOTE" ? "remote" : value === "HYBRID" ? "hybrid" : value === "ON_SITE" ? "office" : "field";
   const normalized = value.toLocaleLowerCase("ru");
   if (/удал[её]н|remote|дистанцион/.test(normalized)) return "remote";
   if (/гибрид|hybrid/.test(normalized)) return "hybrid";
-  if (/офис|onsite|on-site|on site/.test(normalized)) return "office";
+  if (/разъезд|field\s*work/.test(normalized)) return "field";
+  if (/офис|onsite|on-site|on site|на месте работодател/.test(normalized)) return "office";
   return undefined;
+}
+
+function formatAliasKind(value: string): ReturnType<typeof formatKind> {
+  if (formatIds.has(value)) return formatKind(value);
+  const normalized = value.toLocaleLowerCase("ru").replace(/[\s_-]+/g, "");
+  const aliases: Record<string, NonNullable<ReturnType<typeof formatKind>>> = {
+    remote: "remote", удаленно: "remote", удалённо: "remote", дистанционно: "remote",
+    hybrid: "hybrid", гибрид: "hybrid", office: "office", офис: "office", onsite: "office",
+    fieldwork: "field", разъездной: "field",
+  };
+  return aliases[normalized];
+}
+
+type StructuredValue = { id?: string; name?: string; valid: boolean };
+function structuredValues(value: unknown): StructuredValue[] {
+  if (value === undefined || value === null || value === "" || (Array.isArray(value) && value.length === 0)) return [];
+  const items = Array.isArray(value) ? value : [value];
+  return items.map((item) => {
+    if (typeof item === "string") return { id: item, valid: true };
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { valid: false };
+    const record = item as Record<string, unknown>;
+    return { id: typeof record.id === "string" ? record.id : undefined, name: typeof record.name === "string" ? record.name : undefined,
+      valid: typeof record.id === "string" && (record.name === undefined || typeof record.name === "string") };
+  });
 }
 
 function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<RuleResult, "rule_id" | "rule_version"> {
@@ -76,9 +114,24 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
       : { state: found === rule.value ? "match" : "no_match", confidence: 1, source, evidence: `Explicit night_shifts=${found}` };
   }
   if (rule.rule === "work_format") {
+    const entries = structuredValues(vacancy.work_format);
     const values = stringsFrom(vacancy.work_format);
-    const wanted = formatKind(rule.value);
-    const structured = values.map(formatKind).filter((value): value is NonNullable<typeof value> => value !== undefined);
+    const wanted = formatAliasKind(rule.value);
+    const structuredKinds: Array<NonNullable<ReturnType<typeof formatKind>>> = [];
+    if (entries.length) {
+      for (const entry of entries) {
+        if (!entry.valid || !entry.id) return { state: "unknown", confidence: 0, source: "work_format", evidence: excerpt("Malformed work format") };
+        if (!formatIds.has(entry.id)) {
+          const alias = entry.name === undefined ? formatAliasKind(entry.id) : undefined;
+          if (alias) { structuredKinds.push(alias); continue; }
+          return { state: "unknown", confidence: 0, source: "work_format", evidence: excerpt(entry.id) };
+        }
+        const kind = formatKind(entry.id)!;
+        const namedKind = entry.name ? formatAliasKind(entry.name) : undefined;
+        if (namedKind && namedKind !== kind) return { state: "unknown", confidence: 0, source: "work_format", evidence: excerpt(`${entry.id}: ${entry.name}`) };
+        structuredKinds.push(kind);
+      }
+    }
     const descClauses = clauses(description);
     const remoteDenied = descClauses.some((part) => /(?:remote|удал[её]н|дистанцион).{0,45}(?:not\s+available|unavailable|not\s+offered|not\s+allowed|не\s+доступ|не\s+предусмотр|нельзя)/i.test(part)
       || /(?:\bno\s+remote\b|\bremote\s+(?:work|work\s+format)\s+(?:is\s+)?(?:not\s+available|unavailable|not\s+offered|not\s+allowed)|не\s+(?:предусмотрена\s+)?удал[её]н|удал[её]н\w*.{0,30}не\s+(?:доступ|предусмотр|разреш))/i.test(part));
@@ -86,19 +139,24 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
     const descriptionKinds = descClauses.flatMap((part) => {
       if (/(?:remote\s+(?:work|position|format)|work\s+remotely|удал[её]н(?:ная)?\s+(?:работа|формат)|работа\s+(?:удал[её]нно|дистанционно))/i.test(part)) return ["remote" as const];
       if (/(?:hybrid\s+(?:work|format)|гибридн\w*\s+(?:формат|работа))/i.test(part)) return ["hybrid" as const];
+      if (/(?:field\s*work|разъездн[а-яё]*\s+(?:формат|работа|характер)|работа\s+разъездн[а-яё]*)/i.test(part)) return ["field" as const];
       if (/(?:office[- ]based|onsite\s+(?:work|position)|work\s+from\s+(?:the\s+)?office|работа\s+в\s+офисе|офисный\s+формат|обязательное\s+присутствие\s+в\s+офисе)/i.test(part)) return ["office" as const];
       return [];
     });
-    const evidenced = [...new Set([...structured, ...descriptionKinds])];
-    if (remoteDenied && (structured.includes("remote") || descriptionKinds.includes("remote"))) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
-    if ((structured.includes("remote") || descriptionKinds.includes("remote")) && mandatoryOffice) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
-    if (evidenced.length > 1) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description || values.join(" ")) };
+    const evidenced = [...new Set([...structuredKinds, ...descriptionKinds])];
+    if (remoteDenied && (structuredKinds.includes("remote") || descriptionKinds.includes("remote"))) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
+    if ((structuredKinds.includes("remote") || descriptionKinds.includes("remote")) && mandatoryOffice) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description) };
+    if ((!structuredKinds.length && evidenced.length > 1) || (structuredKinds.length && descriptionKinds.some((kind) => !structuredKinds.includes(kind)))) return { state: "unknown", confidence: 0, source: values.length ? "work_format,description" : "description", evidence: excerpt(description || values.join(" ")) };
     if (!evidenced.length || !wanted) return { state: "unknown", confidence: 0, source: "work_format", evidence: "No explicit work format evidence" };
-    return { state: evidenced[0] === wanted ? "match" : "no_match", confidence: values.length ? 0.95 : 0.7, source: values.length ? "work_format" : "description", evidence: excerpt(description || values.join(" ")) };
+    const hasStructured = structuredKinds.length > 0;
+    const found = hasStructured ? structuredKinds : descriptionKinds;
+    return { state: found.includes(wanted) ? "match" : "no_match", confidence: hasStructured ? 0.95 : 0.7, source: hasStructured ? "work_format" : "description", evidence: excerpt(description || values.join(" ")) };
   }
   if (rule.rule === "work_schedule_by_days") {
+    const entries = structuredValues(vacancy.work_schedule_by_days);
     const values = stringsFrom(vacancy.work_schedule_by_days);
     const wanted = canonicalSchedule(rule.value);
+    if (!wanted || !scheduleIds.has(wanted)) return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: "Unknown requested schedule" };
     const wantedPattern = wanted === "TWO_ON_TWO_OFF" ? "(?:2\\s*[/\\-]\\s*2|two\\s+on\\s+two\\s+off|2\\s+через\\s+2|два\\s+через\\s+два)"
       : wanted === "FIVE_ON_TWO_OFF" ? "(?:5\\s*[/\\-]\\s*2|five\\s+on\\s+two\\s+off|5\\s+через\\s+2|пять\\s+через\\s+два)" : undefined;
     const negatedWanted = wantedPattern && clauses(description).some((part) => {
@@ -107,9 +165,27 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
       return negatedBefore.test(part) || negatedAfter.test(part);
     });
     if (negatedWanted) return { state: "unknown", confidence: 0, source: values.length ? "work_schedule_by_days,description" : "description", evidence: excerpt(description) };
-    if (values.length) {
-      const actual = values.map(canonicalSchedule);
-      if (actual.some((value) => value === undefined)) return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: excerpt(values.join(", ")) };
+    if (entries.length) {
+      const actual: string[] = [];
+      for (const entry of entries) {
+        if (!entry.valid || !entry.id) return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: excerpt("Malformed work schedule") };
+        if (!scheduleIds.has(entry.id)) {
+          const alias = entry.name === undefined ? canonicalSchedule(entry.id) : undefined;
+          if (alias) { actual.push(alias); continue; }
+          return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: excerpt(entry.id) };
+        }
+        if (entry.name) {
+          const namedSchedule = canonicalSchedule(entry.name);
+          if (namedSchedule && namedSchedule !== entry.id) return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: excerpt(`${entry.id}: ${entry.name}`) };
+        }
+        actual.push(entry.id);
+      }
+      const descriptionConflict = clauses(description).some((part) => {
+        const numeric = part.match(/\b(\d\s*(?:\/|-)\s*\d)\b/);
+        const described = numeric ? canonicalSchedule(numeric[1]!.replace(/\s/g, "")) : undefined;
+        return described !== undefined && !actual.includes(described);
+      });
+      if (descriptionConflict) return { state: "unknown", confidence: 0, source: "work_schedule_by_days,description", evidence: excerpt(description) };
       const match = actual.includes(wanted);
       return { state: match ? "match" : "no_match", confidence: 0.95, source: "work_schedule_by_days", evidence: excerpt(values.join(", ")) };
     }
@@ -119,7 +195,7 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
       if (/пятиднев\w*/i.test(part)) return ["FIVE_ON_TWO_OFF"];
       return [];
     });
-    if (!scheduleAliases.length || !wanted) return { state: "unknown", confidence: 0, source: "description", evidence: excerpt(description || "No schedule evidence") };
+    if (!scheduleAliases.length) return { state: "unknown", confidence: 0, source: "description", evidence: excerpt(description || "No schedule evidence") };
     return { state: scheduleAliases.includes(wanted) ? "match" : "no_match", confidence: 0.7, source: "description", evidence: excerpt(description) };
   }
   if (rule.rule === "required_technology") {
