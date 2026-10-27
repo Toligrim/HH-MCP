@@ -132,6 +132,7 @@ import {
   handleGetSalaryStatistics,
 } from "./tools/salary.js";
 import { getClientHealth, HhAccessError, HhApiError } from "./client.js";
+import { HhBudgetError } from "./requestBudget.js";
 import { applyToolFilter, parseToolsCliArgs } from "./toolsFilter.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import {
@@ -139,6 +140,7 @@ import {
   getSearchCapabilityData, getVacanciesBatchInputSchema, handleDeepSearch,
   handleExplainSearch, handleGetVacanciesBatchMcp, handlePlanSearch,
   handleResolveSearchDictionary, planSearchInputSchema, resolveDictionaryInputSchema,
+  SearchToolError,
 } from "./tools/search.js";
 
 type ToolResult = {
@@ -155,6 +157,21 @@ function wrapHandler(
       const text = await fn(params, extra);
       return { content: [{ type: "text" as const, text }] };
     } catch (error) {
+      if (safeErrors) {
+        const runtimeError = error instanceof SearchToolError
+          ? { code: error.code, retryable: error.retryable, message: error.message, ...(error.status === undefined ? {} : { status: error.status }) }
+          : error instanceof HhAccessError
+              ? { code: "hh_access_error", retryable: false, status: error.status, message: error.message }
+              : error instanceof HhApiError
+                ? { code: "hh_api_error", retryable: error.status === 429 || error.status >= 500, status: error.status, message: error.message }
+                : error instanceof HhBudgetError
+                  ? { code: error.code, retryable: error.code === "cancelled", message: error.message }
+                  : error instanceof Error && error.name === "AbortError"
+                    ? { code: "cancelled", retryable: true, message: "Search request was cancelled." }
+                    : { code: "search_request_failed", retryable: false, message: error instanceof Error ? error.message : "Search request failed." };
+        runtimeError.message = runtimeError.message.slice(0, 500);
+        return { isError: true, content: [{ type: "text" as const, text: `ERROR: ${JSON.stringify(runtimeError)}` }] };
+      }
       if (error instanceof HhAccessError) {
         const structured = JSON.stringify(error.toStructured());
         return {
@@ -635,7 +652,7 @@ const ALL_TOOLS: ToolDef[] = [
 
 /** Unfiltered default surface (compile-time / test assertion). */
 export const DEFAULT_TOOL_NAMES = ALL_TOOLS.map((t) => t.name);
-export const DEFAULT_TOOL_COUNT = ALL_TOOLS.length; // 55 = 52 + 3
+export const DEFAULT_TOOL_COUNT = ALL_TOOLS.length;
 
 let activeTools: ToolDef[] = ALL_TOOLS;
 let filterMeta = {

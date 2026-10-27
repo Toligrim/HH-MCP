@@ -107,6 +107,23 @@ describe("search tools over the MCP transport", () => {
     } finally { await close(); }
   });
 
+  it("returns structured search runtime errors without echoing HH response bodies", async () => {
+    silentEnv();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ secret: "upstream detail" }), {
+      status: 400, statusText: "Bad Request", headers: { "content-type": "application/json" },
+    })));
+    configureTools({ allow: "search", env: {} });
+    const { client, close } = await connect();
+    try {
+      const result = await client.callTool({ name: "resolve_search_dictionary", arguments: { dictionary: "areas", text: "Moscow" } });
+      expect(result.isError).toBe(true);
+      const text = (result.content as { text: string }[])[0]!.text;
+      const error = JSON.parse(text.replace(/^ERROR:\s*/, ""));
+      expect(error).toMatchObject({ code: "hh_api_error", retryable: false, status: 400 });
+      expect(text).not.toContain("upstream detail");
+    } finally { await close(); }
+  });
+
   it("applies omitted MCP limits and reports the actual active inventory", async () => {
     configureTools({ allow: "search", env: {} });
     const { client, close } = await connect();
@@ -142,18 +159,25 @@ describe("search tools over the MCP transport", () => {
     try {
       const args = { native: { text: "go" }, limits: { max_requests: 1, max_items: 5 } };
       const first = client.callTool({ name: "deep_search", arguments: args });
-      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
-      const busy = await client.callTool({ name: "deep_search", arguments: args });
-      expect(busy.isError).toBe(true);
-      expect((busy.content as { text: string }[])[0]!.text).toMatch(/already running.*retry/i);
-      release(response({ items: [], found: 0, pages: 0 }));
-      const completed = await first;
-      expect(completed.isError).not.toBe(true);
-      expect(fetch).toHaveBeenCalledTimes(1);
-      const next = client.callTool({ name: "deep_search", arguments: args });
-      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
-      release(response({ items: [], found: 0, pages: 0 }));
-      expect((await next).isError).not.toBe(true);
+      try {
+        await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+        const busy = await client.callTool({ name: "deep_search", arguments: args });
+        expect(busy.isError).toBe(true);
+        const busyError = JSON.parse((busy.content as { text: string }[])[0]!.text.replace(/^ERROR:\s*/, ""));
+        expect(busyError).toMatchObject({ code: "deep_search_busy", retryable: true });
+        expect(busyError.message).toMatch(/already running.*retry/i);
+        release(response({ items: [], found: 0, pages: 0 }));
+        const completed = await first;
+        expect(completed.isError).not.toBe(true);
+        expect(fetch).toHaveBeenCalledTimes(1);
+        const next = client.callTool({ name: "deep_search", arguments: args });
+        await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+        release(response({ items: [], found: 0, pages: 0 }));
+        expect((await next).isError).not.toBe(true);
+      } finally {
+        release(response({ items: [], found: 0, pages: 0 }));
+        await first.catch(() => undefined);
+      }
     } finally { await close(); }
   });
 
@@ -227,6 +251,49 @@ describe("search tools over the MCP transport", () => {
       expect(payload.summaries_returned).toBe(payload.summaries.length);
       expect(payload.summaries_truncated).toBe(true);
       expect(payload.total_known).toBe(20);
+    } finally { await close(); }
+  });
+
+  it("separates verified exclusions from matched and review results and summaries", async () => {
+    silentEnv();
+    const fetch = vi.fn(async (input: unknown) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/vacancies/1") return response({ id: "1", description: "Работа без звонков." });
+      if (url.pathname === "/vacancies/2") return response({ id: "2", description: "Обязательные звонки клиентам каждый день." });
+      if (url.pathname === "/vacancies/3") return response({ id: "3", description: "Работа в дружной команде." });
+      return response({
+        items: [
+          { id: "1", name: "Без звонков" },
+          { id: "2", name: "Звонки обязательны" },
+          { id: "3", name: "Условия не указаны" },
+        ],
+        found: 3,
+        pages: 1,
+      });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const { client, close } = await connect();
+    try {
+      const result = await client.callTool({ name: "deep_search", arguments: {
+        native: { text: "operator" },
+        post_filters: [{ rule: "no_mandatory_phone_calls" }],
+        filter_mode: "inclusive",
+        limits: { max_requests: 4, max_items: 5, max_detail_fetches: 3 },
+      } });
+      const payload = JSON.parse((result.content as { text: string }[])[0]!.text);
+      expect(payload.matched_ids).toEqual(["1"]);
+      expect(payload.review_ids).toEqual(["3"]);
+      expect(payload.excluded_ids).toEqual(["2"]);
+      expect(payload.matched_count).toBe(1);
+      expect(payload.review_count).toBe(1);
+      expect(payload.excluded_count).toBe(1);
+      expect(payload.summaries.map((item: { id: string; classification: string }) => [item.id, item.classification])).toEqual([
+        ["1", "matched"], ["3", "review"],
+      ]);
+      expect(payload.summaries.map((item: { id: string }) => item.id)).not.toContain("2");
+      expect(payload.review_ids).not.toContain("2");
+      expect(payload.summaries_returned).toBe(payload.summaries.length);
+      expect(payload.excluded_ids_returned).toBe(payload.excluded_ids.length);
     } finally { await close(); }
   });
 });

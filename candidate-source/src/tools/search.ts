@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import { HhApiError } from "../client.js";
 import { createHhRequestBudget } from "../requestBudget.js";
 import { explainVacancyQuery, searchVacanciesSchema } from "../search/query.js";
 import { resolveSearchDictionary, resolveSearchDictionarySchema } from "../search/dictionaries.js";
@@ -8,6 +9,18 @@ import { collectSearch } from "../search/collector.js";
 import { fetchVacanciesBatch, getVacanciesBatchSchema } from "./vacancyBatch.js";
 
 export type McpExtra = RequestHandlerExtra<any, any>;
+
+export class SearchToolError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retryable = false,
+    readonly status?: number,
+  ) {
+    super(message);
+    this.name = "SearchToolError";
+  }
+}
 
 const MCP_LIMITS = {
   max_requests: 25,
@@ -37,7 +50,7 @@ let deepSearchBusy = false;
 
 function boundedJson(value: unknown, label: string): string {
   const output = JSON.stringify(value);
-  if (Buffer.byteLength(output, "utf8") > 64 * 1024) throw new Error(`${label} exceeds the 64 KiB MCP response limit; narrow the query or reduce the requested scope.`);
+  if (Buffer.byteLength(output, "utf8") > 64 * 1024) throw new SearchToolError("response_too_large", `${label} exceeds the 64 KiB MCP response limit; narrow the query or reduce the requested scope.`);
   return output;
 }
 
@@ -49,7 +62,7 @@ function withMcpLimits(input: unknown): Record<string, unknown> {
 
 function assertMcpCaps(limits: Record<string, number>): void {
   for (const key of Object.keys(MCP_LIMITS) as (keyof typeof MCP_LIMITS)[]) {
-    if (limits[key]! > MCP_LIMITS[key]) throw new Error(`MCP limit ${key} exceeds the maximum ${MCP_LIMITS[key]}.`);
+    if (limits[key]! > MCP_LIMITS[key]) throw new SearchToolError("mcp_limit_exceeded", `MCP limit ${key} exceeds the maximum ${MCP_LIMITS[key]}.`);
   }
 }
 
@@ -71,13 +84,26 @@ export async function handleResolveSearchDictionary(input: unknown, extra?: McpE
   try {
     result = await resolveSearchDictionary(parsed, { request: { budget, signal: extra?.signal } });
   } catch (error) {
+    if (error instanceof HhApiError) {
+      throw new SearchToolError("hh_api_error", "HH dictionary request failed.", error.status === 429 || error.status >= 500, error.status);
+    }
     if (error instanceof Error) throw new Error(error.name === "HhApiError" ? "HH dictionary request failed." : error.message);
     throw new Error("HH dictionary request failed.");
   }
   return boundedJson(result, "Dictionary result");
 }
 
-function summarizeItem(item: Awaited<ReturnType<typeof collectSearch>>["items"][number]) {
+type SearchItem = Awaited<ReturnType<typeof collectSearch>>["items"][number];
+type SearchDisposition = "matched" | "review" | "excluded";
+
+function disposition(item: SearchItem): SearchDisposition {
+  if (!item.filtering) return "matched";
+  if (item.filtering.decision === "exclude") return "excluded";
+  if (item.filtering.state === "verified" && item.filtering.decision === "keep") return "matched";
+  return "review";
+}
+
+function summarizeItem(item: SearchItem, classification: Exclude<SearchDisposition, "excluded">) {
   const raw = item.raw_search;
   const employer = raw.employer && typeof raw.employer === "object" ? raw.employer as Record<string, unknown> : {};
   const area = raw.area && typeof raw.area === "object" ? raw.area as Record<string, unknown> : {};
@@ -85,6 +111,7 @@ function summarizeItem(item: Awaited<ReturnType<typeof collectSearch>>["items"][
   const snippet = raw.snippet && typeof raw.snippet === "object" ? raw.snippet as Record<string, unknown> : {};
   return {
     id: item.id,
+    classification,
     name: typeof raw.name === "string" ? raw.name : undefined,
     employer: typeof employer.name === "string" ? employer.name : undefined,
     employer_id: employer.id,
@@ -104,18 +131,26 @@ export async function handleDeepSearch(input: unknown, extra?: McpExtra): Promis
   const prepared = withMcpLimits(input);
   const limits = prepared.limits as Record<string, number>;
   assertMcpCaps(limits);
-  if (deepSearchBusy) throw new Error("A deep_search call is already running in this process; retry after it completes.");
+  if (deepSearchBusy) throw new SearchToolError("deep_search_busy", "A deep_search call is already running in this process; retry after it completes.", true);
   deepSearchBusy = true;
   try {
     const plan = planSearch(prepared);
     const collected = await collectSearch(plan, { signal: extra?.signal });
-    const matched = collected.items.filter((item) => !item.filtering || item.filtering.state === "verified" && item.filtering.decision === "keep").map((item) => item.id);
-    const review = collected.items.filter((item) => !!item.filtering && (item.filtering.state !== "verified" || item.filtering.decision !== "keep")).map((item) => item.id);
+    const matched = collected.items.filter((item) => disposition(item) === "matched");
+    const review = collected.items.filter((item) => disposition(item) === "review");
+    const excluded = collected.items.filter((item) => disposition(item) === "excluded");
+    const primary = [...matched.map((item) => ({ item, classification: "matched" as const })), ...review.map((item) => ({ item, classification: "review" as const }))];
+    const matchedIds = matched.map((item) => item.id);
+    const reviewIds = review.map((item) => item.id);
+    const excludedIds = excluded.map((item) => item.id);
     const envelope: Record<string, unknown> = {
       status: collected.status,
       plan: { signature: plan.signature, mode: plan.mode, created_at: plan.created_at, frozen_date_bounds: plan.frozen_date_bounds },
       total_known: collected.manifest.known_items,
       found: collected.manifest.found,
+      matched_count: matched.length,
+      review_count: review.length,
+      excluded_count: excluded.length,
       coverage: { status: collected.manifest.status, branches: collected.manifest.branches, partitions: collected.manifest.partitions, warnings: collected.manifest.warnings },
       applied_filters: {
         base_template: plan.native,
@@ -125,15 +160,19 @@ export async function handleDeepSearch(input: unknown, extra?: McpExtra): Promis
         details: plan.details,
       },
       unsupported_filters: [],
-      matched_ids: matched.slice(0, 500),
-      matched_ids_returned: Math.min(matched.length, 500),
-      matched_ids_truncated: matched.length > 500,
-      review_ids: review.slice(0, 500),
-      review_ids_returned: Math.min(review.length, 500),
-      review_ids_truncated: review.length > 500,
-      summaries: collected.items.slice(0, 20).map(summarizeItem),
-      summaries_returned: Math.min(collected.items.length, 20),
-      summaries_truncated: collected.items.length > 20,
+      matched_ids: matchedIds.slice(0, 500),
+      matched_ids_returned: Math.min(matchedIds.length, 500),
+      matched_ids_truncated: matchedIds.length > 500,
+      review_ids: reviewIds.slice(0, 500),
+      review_ids_returned: Math.min(reviewIds.length, 500),
+      review_ids_truncated: reviewIds.length > 500,
+      excluded_ids: excludedIds.slice(0, 500),
+      excluded_ids_returned: Math.min(excludedIds.length, 500),
+      excluded_ids_truncated: excludedIds.length > 500,
+      summaries: primary.slice(0, 20).map(({ item, classification }) => summarizeItem(item, classification)),
+      summaries_total: primary.length,
+      summaries_returned: Math.min(primary.length, 20),
+      summaries_truncated: primary.length > 20,
       gaps: collected.manifest.gaps,
       errors: collected.manifest.partitions.filter((part) => part.error).map(({ branch, id, error }) => ({ branch, partition_id: id, error })),
       provenance: { source: "hh.ru live search index", snapshot_at: collected.checkpoint.updated_at, limitations: collected.manifest.warnings },
@@ -141,18 +180,21 @@ export async function handleDeepSearch(input: unknown, extra?: McpExtra): Promis
       counts: { requests: collected.manifest.requests, retries: collected.manifest.retries, bytes: collected.manifest.bytes, detail_fetches: collected.manifest.detail_fetches },
     };
     let output = JSON.stringify(envelope);
-    while (Buffer.byteLength(output, "utf8") > 64 * 1024 && ((envelope.summaries as unknown[]).length || (envelope.matched_ids as unknown[]).length || (envelope.review_ids as unknown[]).length)) {
+    while (Buffer.byteLength(output, "utf8") > 64 * 1024 && ((envelope.summaries as unknown[]).length || (envelope.matched_ids as unknown[]).length || (envelope.review_ids as unknown[]).length || (envelope.excluded_ids as unknown[]).length)) {
       const summaries = envelope.summaries as unknown[];
       const matchedIds = envelope.matched_ids as unknown[];
       const reviewIds = envelope.review_ids as unknown[];
+      const excludedIds = envelope.excluded_ids as unknown[];
       if (summaries.length) { summaries.pop(); envelope.summaries_truncated = true; }
       else if (matchedIds.length) { matchedIds.pop(); envelope.matched_ids_truncated = true; }
-      else { reviewIds.pop(); envelope.review_ids_truncated = true; }
+      else if (reviewIds.length) { reviewIds.pop(); envelope.review_ids_truncated = true; }
+      else { excludedIds.pop(); envelope.excluded_ids_truncated = true; }
       output = JSON.stringify(envelope);
     }
-    if (Buffer.byteLength(output, "utf8") > 64 * 1024) throw new Error("Deep search metadata exceeds the 64 KiB MCP response limit.");
+    if (Buffer.byteLength(output, "utf8") > 64 * 1024) throw new SearchToolError("response_too_large", "Deep search metadata exceeds the 64 KiB MCP response limit.");
     envelope.matched_ids_returned = (envelope.matched_ids as unknown[]).length;
     envelope.review_ids_returned = (envelope.review_ids as unknown[]).length;
+    envelope.excluded_ids_returned = (envelope.excluded_ids as unknown[]).length;
     envelope.summaries_returned = (envelope.summaries as unknown[]).length;
     output = JSON.stringify(envelope);
     return output;
