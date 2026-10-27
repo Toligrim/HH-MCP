@@ -4,7 +4,7 @@ import { HhApiError } from "../client.js";
 import { createHhRequestBudget } from "../requestBudget.js";
 import { explainVacancyQuery, searchVacanciesSchema } from "../search/query.js";
 import { resolveSearchDictionary, resolveSearchDictionarySchema } from "../search/dictionaries.js";
-import { searchSpecSchema, planSearch } from "../search/planner.js";
+import { searchSpecObjectSchema, planSearch } from "../search/planner.js";
 import { collectSearch } from "../search/collector.js";
 import { fetchVacanciesBatch, getVacanciesBatchSchema } from "./vacancyBatch.js";
 
@@ -36,8 +36,7 @@ const limitsInputSchema = z.object({
   max_bytes: z.number().int().positive().optional(),
   max_detail_fetches: z.number().int().nonnegative().optional(),
 }).strict();
-const planObject = searchSpecSchema.innerType();
-export const planSearchInputSchema = planObject.extend({ limits: limitsInputSchema.optional() }).strict();
+export const planSearchInputSchema = searchSpecObjectSchema.extend({ limits: limitsInputSchema.optional() }).strict();
 export const explainSearchInputSchema = searchVacanciesSchema.extend({
   district: z.union([z.string().trim().min(1).max(120), z.array(z.string().trim().min(1).max(120)).min(1).max(20)]).optional(),
 }).strict();

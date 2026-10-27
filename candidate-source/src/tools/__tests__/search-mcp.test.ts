@@ -107,6 +107,25 @@ describe("search tools over the MCP transport", () => {
     } finally { await close(); }
   });
 
+  it("enforces the SDK element ceiling before schema parsing and remains usable", async () => {
+    configureTools({ env: {} });
+    const fetch = vi.fn(async () => response({ items: [], found: 0, pages: 0 }));
+    vi.stubGlobal("fetch", fetch);
+    const { client, close } = await connect();
+    try {
+      const tooMany = await client.callTool({ name: "search_vacancies", arguments: {
+        area: Array.from({ length: 20_001 }, (_, index) => String(index + 1)),
+      } });
+      expect(tooMany.isError).toBe(true);
+      expect((tooMany.content as { text: string }[])[0]!.text).toMatch(/maximum of 20000 elements/i);
+      expect(fetch).not.toHaveBeenCalled();
+
+      const small = await client.callTool({ name: "plan_search", arguments: { native: { text: "go" } } });
+      expect(small.isError).not.toBe(true);
+      expect(fetch).not.toHaveBeenCalled();
+    } finally { await close(); }
+  });
+
   it("returns structured search runtime errors without echoing HH response bodies", async () => {
     silentEnv();
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ secret: "upstream detail" }), {

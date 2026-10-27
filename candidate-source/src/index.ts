@@ -684,7 +684,7 @@ export function createServer(): McpServer {
   const server = new McpServer({
     name: "hh-mcp",
     version: VERSION,
-  });
+  }, { maxToolInputElements: 20_000 });
   for (const tool of activeTools) {
     if (tool.fullSchema) {
       server.registerTool(tool.name, {
@@ -715,34 +715,89 @@ export function getHealthPayload(): Record<string, unknown> {
 
 // --- HTTP body reader (stateless transport needs the parsed body) ---
 
-const MAX_BODY = 4 * 1024 * 1024;
+const MAX_BODY = 256 * 1024;
+const MAX_JSON_DEPTH = 64;
+
+class HttpInputError extends Error {
+  constructor(readonly status: 400 | 413, message: string) {
+    super(message);
+  }
+}
+
+function assertJsonDepth(raw: string): void {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (const character of raw) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{" || character === "[") {
+      depth++;
+      if (depth > MAX_JSON_DEPTH) {
+        throw new HttpInputError(400, "Request JSON nesting exceeds the maximum depth.");
+      }
+    } else if (character === "}" || character === "]") {
+      depth = Math.max(0, depth - 1);
+    }
+  }
+}
 
 function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let settled = false;
+    const rejectInput = (error: HttpInputError) => {
+      if (settled) return;
+      settled = true;
+      req.pause();
+      reject(error);
+    };
+
+    const declaredLength = Number(req.headers["content-length"]);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY) {
+      rejectInput(new HttpInputError(413, "Request body exceeds the 256 KiB limit."));
+      return;
+    }
+
     req.on("data", (chunk: Buffer) => {
+      if (settled) return;
       size += chunk.length;
       if (size > MAX_BODY) {
-        reject(new Error("Request body too large"));
-        req.destroy();
+        rejectInput(new HttpInputError(413, "Request body exceeds the 256 KiB limit."));
         return;
       }
       chunks.push(chunk);
     });
     req.on("end", () => {
+      if (settled) return;
       const raw = Buffer.concat(chunks).toString("utf8");
       if (!raw) {
+        settled = true;
         resolve(undefined);
         return;
       }
       try {
+        assertJsonDepth(raw);
+        settled = true;
         resolve(JSON.parse(raw));
-      } catch (err) {
-        reject(err);
+      } catch (error) {
+        settled = true;
+        reject(error instanceof HttpInputError
+          ? error
+          : new HttpInputError(400, "Invalid JSON request body."));
       }
     });
-    req.on("error", reject);
+    req.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
   });
 }
 
@@ -803,6 +858,7 @@ async function main() {
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
           enableDnsRebindingProtection: true,
+          maxRequestBodySize: MAX_BODY,
           allowedHosts,
           ...(allowedOrigins ? { allowedOrigins } : {}),
         });
@@ -815,15 +871,24 @@ async function main() {
           const body = await readJsonBody(req);
           await transport.handleRequest(req, res, body);
         } catch (err) {
-          console.error("[hh-mcp] request error:", err);
+          const inputError = err instanceof HttpInputError ? err : undefined;
+          if (!inputError) console.error("[hh-mcp] HTTP request failed.");
           if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
+            const status = inputError?.status ?? 500;
+            res.writeHead(status, {
+              "Content-Type": "application/json",
+              ...(status === 413 ? { Connection: "close" } : {}),
+            });
             res.end(
               JSON.stringify({
                 jsonrpc: "2.0",
-                error: { code: -32603, message: "Internal server error" },
+                error: {
+                  code: inputError?.status === 400 ? -32700 : inputError?.status === 413 ? -32000 : -32603,
+                  message: inputError?.message ?? "Internal server error",
+                },
                 id: null,
               }),
+              () => { if (status === 413) req.destroy(); },
             );
           }
         }

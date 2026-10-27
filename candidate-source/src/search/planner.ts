@@ -11,7 +11,7 @@ const limitsSchema = z.object({
   max_bytes: z.number().int().positive().max(128 * 1024 * 1024),
   max_detail_fetches: z.number().int().nonnegative().max(50_000),
 }).strict();
-export const searchSpecSchema = z.object({
+export const searchSpecObjectSchema = z.object({
   mode: z.enum(["fast", "comprehensive", "exhaustive_within_api"]).default("comprehensive"),
   native: nativeInputSchema,
   branches: z.array(z.object({ name: z.string().trim().min(1).max(64), native: nativeInputSchema }).strict()).min(1).max(8).optional(),
@@ -19,7 +19,9 @@ export const searchSpecSchema = z.object({
   filter_mode: z.enum(["strict", "inclusive", "review"]).default("inclusive"),
   details: z.enum(["none", "full"]).default("none"),
   limits: limitsSchema,
-}).strict().superRefine((spec, ctx) => {
+}).strict();
+
+export const searchSpecSchema = searchSpecObjectSchema.superRefine((spec, ctx) => {
   const names = spec.branches?.map((branch) => branch.name) ?? [];
   if (new Set(names).size !== names.length) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["branches"], message: "branch names must be unique" });
 });
