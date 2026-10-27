@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { hhGet } from "../client.js";
+import { hhGet, type HhGetOptions } from "../client.js";
 
 const seed: Record<string, string[]> = {
   vacancy_search_fields: ["name", "company_name", "description"],
@@ -123,7 +123,7 @@ function upsert(key: string, entry: Entry): void {
   }
 }
 
-export async function resolveSearchDictionary(input: { dictionary: string; text: string }, options?: { now?: number }): Promise<unknown> {
+export async function resolveSearchDictionary(input: { dictionary: string; text: string }, options?: { now?: number; request?: HhGetOptions }): Promise<unknown> {
   const { dictionary, text } = resolveSearchDictionarySchema.parse(input);
   const now = options?.now ?? Date.now();
   let entry = dictionary === "education"
@@ -138,7 +138,7 @@ export async function resolveSearchDictionary(input: { dictionary: string; text:
     : cache.get(dictionary);
   if (dictionary !== "education" && (!entry || now - entry.loaded_at >= TTL_MS)) {
     const endpoint = endpointMap[dictionary]!;
-    const response = await hhGet(endpoint.path);
+    const response = await hhGet(endpoint.path, options?.request);
     const keys = endpoint.key === undefined ? [] : Array.isArray(endpoint.key) ? endpoint.key : [endpoint.key];
     let selected = extractItems(dictionary, response, keys);
     if (dictionary === "part_time") {

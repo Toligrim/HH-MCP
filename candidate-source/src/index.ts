@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import http from "node:http";
-import type { ZodRawShape } from "zod";
+import { type ZodRawShape, type ZodObject } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -133,6 +133,13 @@ import {
 } from "./tools/salary.js";
 import { getClientHealth, HhAccessError, HhApiError } from "./client.js";
 import { applyToolFilter, parseToolsCliArgs } from "./toolsFilter.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import {
+  deepSearchInputSchema, emptyInputSchema, explainSearchInputSchema,
+  getSearchCapabilityData, getVacanciesBatchInputSchema, handleDeepSearch,
+  handleExplainSearch, handleGetVacanciesBatchMcp, handlePlanSearch,
+  handleResolveSearchDictionary, planSearchInputSchema, resolveDictionaryInputSchema,
+} from "./tools/search.js";
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
@@ -140,11 +147,12 @@ type ToolResult = {
 };
 
 function wrapHandler(
-  fn: (params: any) => Promise<string>,
-): (params: any) => Promise<ToolResult> {
-  return async (params) => {
+  fn: (params: any, extra?: RequestHandlerExtra<any, any>) => Promise<string>,
+  safeErrors = false,
+): (params: any, extra?: RequestHandlerExtra<any, any>) => Promise<ToolResult> {
+  return async (params, extra) => {
     try {
-      const text = await fn(params);
+      const text = await fn(params, extra);
       return { content: [{ type: "text" as const, text }] };
     } catch (error) {
       if (error instanceof HhAccessError) {
@@ -159,8 +167,9 @@ function wrapHandler(
           ],
         };
       }
-      const message =
-        error instanceof HhApiError
+      const message = safeErrors
+        ? error instanceof Error ? error.message : "Search request failed."
+        : error instanceof HhApiError
           ? `Error ${error.status}: ${error.message}${error.body ? `\n${error.body}` : ""}`
           : error instanceof Error
             ? error.message
@@ -178,8 +187,11 @@ function wrapHandler(
 interface ToolDef {
   name: string;
   description: string;
-  schema: ZodRawShape;
-  handler: (params: any) => Promise<string>;
+  schema: ZodRawShape | ZodObject<any>;
+  handler: (params: any, extra?: RequestHandlerExtra<any, any>) => Promise<string>;
+  fullSchema?: boolean;
+  safeErrors?: boolean;
+  readOnly?: boolean;
   group: string;
   groups?: string[];
 }
@@ -200,7 +212,8 @@ const ALL_TOOLS: ToolDef[] = [
       name: "search_vacancies",
       description:
         "Search job vacancies on hh.ru by keywords, region, professional role, industry, metro, salary, experience, employment form, work format, date range and labels. Returns a compact paginated summary (pass raw:true for full JSON).",
-      schema: searchVacanciesSchema.shape,
+      schema: searchVacanciesSchema,
+      fullSchema: true,
       handler: handleSearchVacancies,
     },
     {
@@ -592,6 +605,14 @@ const ALL_TOOLS: ToolDef[] = [
       handler: handleSuggestSkillSet,
     },
   ]),
+  ...g("search", [
+    { name: "plan_search", description: "Build a bounded search plan without making HH requests.", schema: planSearchInputSchema, handler: handlePlanSearch, fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "explain_search", description: "Explain how vacancy search inputs map to HH query parameters; does not execute a search.", schema: explainSearchInputSchema, handler: handleExplainSearch, fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "deep_search", description: "Collect a bounded, synchronous vacancy search with explicit coverage and uncertainty reporting.", schema: deepSearchInputSchema, handler: handleDeepSearch, fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "get_capabilities", description: "Describe enabled search tools, limits, and server capabilities.", schema: emptyInputSchema, handler: async () => JSON.stringify(getSearchCapabilityData(activeTools.map((tool) => tool.name), VERSION)), fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "resolve_search_dictionary", description: "Resolve a term against a bounded public HH search dictionary.", schema: resolveDictionaryInputSchema, handler: handleResolveSearchDictionary, fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "get_vacancies_batch", description: "Fetch full vacancy cards for up to 20 vacancy IDs.", schema: getVacanciesBatchInputSchema, handler: handleGetVacanciesBatchMcp, fullSchema: true, safeErrors: true, readOnly: true },
+  ]),
   ...g("salary", [
     {
       name: "get_salary_statistics",
@@ -648,7 +669,15 @@ export function createServer(): McpServer {
     version: VERSION,
   });
   for (const tool of activeTools) {
-    server.tool(tool.name, tool.description, tool.schema, wrapHandler(tool.handler));
+    if (tool.fullSchema) {
+      server.registerTool(tool.name, {
+        description: tool.description,
+        inputSchema: tool.schema as ZodObject<any>,
+        ...(tool.readOnly ? { annotations: { readOnlyHint: true } } : {}),
+      }, async (params, extra) => wrapHandler(tool.handler, tool.safeErrors)(params, extra));
+    } else {
+      server.tool(tool.name, tool.description, tool.schema as ZodRawShape, wrapHandler(tool.handler));
+    }
   }
   return server;
 }

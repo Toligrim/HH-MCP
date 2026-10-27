@@ -149,11 +149,15 @@ describe("tools filter", () => {
 });
 
 describe("default tool surface", () => {
-  it("is 55 tools with stable new names", () => {
-    expect(DEFAULT_TOOL_COUNT).toBe(55);
+  it("is 61 tools with stable new names", () => {
+    expect(DEFAULT_TOOL_COUNT).toBe(61);
     expect(DEFAULT_TOOL_NAMES).toContain("get_resumes");
     expect(DEFAULT_TOOL_NAMES).toContain("collect_vacancy_resumes");
     expect(DEFAULT_TOOL_NAMES).toContain("hh_usage_report");
+    expect(DEFAULT_TOOL_NAMES).toEqual(expect.arrayContaining([
+      "plan_search", "explain_search", "deep_search", "get_capabilities",
+      "resolve_search_dictionary", "get_vacancies_batch",
+    ]));
     expect(DEFAULT_TOOL_NAMES.indexOf("get_resume")).toBeLessThan(
       DEFAULT_TOOL_NAMES.indexOf("get_resumes"),
     );

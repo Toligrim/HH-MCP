@@ -1073,8 +1073,8 @@ describe("vacancy extras + saved searches", () => {
 });
 
 describe("tool registry", () => {
-  it("exposes 52 tools", () => {
-    expect(TOOL_COUNT).toBe(55);
+  it("exposes 61 tools", () => {
+    expect(TOOL_COUNT).toBe(61);
   });
 });
 
