@@ -35,7 +35,11 @@ function safeError(error: unknown): { code: string; status?: number } {
   if (error instanceof HhAccessError) return { code: error.kind === "captcha" ? "captcha" : "forbidden", status: 403 };
   if (error instanceof HhApiError) return { code: `http_${error.status}`, status: error.status };
   if (error instanceof Error && error.name === "AbortError") return { code: "cancelled" };
+  if (error instanceof TypeError) return { code: "network_error" };
   return { code: "request_failed" };
+}
+function retryablePartitionError(error: Partition["error"]): boolean {
+  return Boolean(error && (error.code === "network_error" || /^http_5\d\d$/.test(error.code)));
 }
 function canonicalId(raw: unknown): string | undefined {
   if (typeof raw !== "string" && typeof raw !== "number") return undefined;
@@ -159,6 +163,18 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
     for (const part of cp.partitions) if (part.status === "running") part.status = "pending";
     cp.running_detail_id = undefined;
     if (!cp.gaps.some((g) => g.code === "interrupted_http_unknown")) cp.gaps.push({ code: "interrupted_http_unknown", detail: "A previous process may have sent a request after the last persisted checkpoint; its response and exact attempt count are unknown." });
+  }
+  if (options.checkpoint) {
+    const retryBudgetAvailable = cp.counters.requests < plan.limits.max_requests
+      && cp.counters.bytes < plan.limits.max_bytes
+      && cp.counters.active_elapsed_ms < plan.limits.max_duration_sec * 1000;
+    for (const part of cp.partitions) {
+      if (!retryBudgetAvailable || part.status !== "failed" || !retryablePartitionError(part.error)) continue;
+      const resolvedCode = part.error!.code;
+      part.status = "pending";
+      delete part.error;
+      cp.gaps = cp.gaps.filter((gap) => !(gap.partition_id === part.id && gap.code === resolvedCode));
+    }
   }
   if (options.checkpoint) cp.gaps = cp.gaps.filter((gap) => gap.code !== "cancelled");
   cp.status = "RUNNING";
@@ -366,8 +382,7 @@ export async function collectSearch(plan: SearchPlan, options: CollectSearchOpti
         item.detail_checked = true;
         item.raw_detail = detail;
         if (plan.post_filters.length) {
-          const description = typeof detail.description === "string" ? detail.description.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim() : "";
-          const evaluated = evaluatePostFilters({ ...detail, description }, plan.post_filters, plan.filter_mode);
+          const evaluated = evaluatePostFilters(detail, plan.post_filters, plan.filter_mode);
           item.filtering = { state: evaluated.rules.some((rule) => rule.state === "unknown") ? "unknown" : "verified", decision: evaluated.decision, rules: evaluated.rules };
         }
         if (plan.details === "none") delete item.raw_detail;

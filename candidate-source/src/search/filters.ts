@@ -80,7 +80,8 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
     const wanted = formatKind(rule.value);
     const structured = values.map(formatKind).filter((value): value is NonNullable<typeof value> => value !== undefined);
     const descClauses = clauses(description);
-    const remoteDenied = descClauses.some((part) => /(?:remote|удал[её]н|дистанцион).{0,45}(?:not\s+available|unavailable|not\s+offered|not\s+allowed|не\s+доступ|не\s+предусмотр|нельзя)/i.test(part));
+    const remoteDenied = descClauses.some((part) => /(?:remote|удал[её]н|дистанцион).{0,45}(?:not\s+available|unavailable|not\s+offered|not\s+allowed|не\s+доступ|не\s+предусмотр|нельзя)/i.test(part)
+      || /(?:\bno\s+remote\b|\bremote\s+(?:work|work\s+format)\s+(?:is\s+)?(?:not\s+available|unavailable|not\s+offered|not\s+allowed)|не\s+(?:предусмотрена\s+)?удал[её]н|удал[её]н\w*.{0,30}не\s+(?:доступ|предусмотр|разреш))/i.test(part));
     const mandatoryOffice = descClauses.some((part) => /(?:mandatory|обязательн|требуется).{0,45}(?:office|офис)|(?:office|офис).{0,45}(?:mandatory|required|обязательн)/i.test(part));
     const descriptionKinds = descClauses.flatMap((part) => {
       if (/(?:remote\s+(?:work|position|format)|work\s+remotely|удал[её]н(?:ная)?\s+(?:работа|формат)|работа\s+(?:удал[её]нно|дистанционно))/i.test(part)) return ["remote" as const];
@@ -98,6 +99,14 @@ function ruleEvidence(vacancy: Record<string, unknown>, rule: PostFilter): Omit<
   if (rule.rule === "work_schedule_by_days") {
     const values = stringsFrom(vacancy.work_schedule_by_days);
     const wanted = canonicalSchedule(rule.value);
+    const wantedPattern = wanted === "TWO_ON_TWO_OFF" ? "(?:2\\s*[/\\-]\\s*2|two\\s+on\\s+two\\s+off|2\\s+через\\s+2|два\\s+через\\s+два)"
+      : wanted === "FIVE_ON_TWO_OFF" ? "(?:5\\s*[/\\-]\\s*2|five\\s+on\\s+two\\s+off|5\\s+через\\s+2|пять\\s+через\\s+два)" : undefined;
+    const negatedWanted = wantedPattern && clauses(description).some((part) => {
+      const negatedBefore = new RegExp(`(?:\\b(?:not|do not|does not|don't|doesn't)(?:\\s+(?:work|offer|use|follow|schedule)){0,3}\\s+|\\bno\\s+|не\\s+(?:работаем\\s+)?)(?:schedule\\s+)?${wantedPattern}`, "iu");
+      const negatedAfter = new RegExp(`${wantedPattern}\\s+(?:(?:is|was)\\s+)?(?:not\\s+(?:offered|available|used|followed)|isn't\\s+(?:offered|available)|не\\s+(?:предлагается|доступен|используется))`, "iu");
+      return negatedBefore.test(part) || negatedAfter.test(part);
+    });
+    if (negatedWanted) return { state: "unknown", confidence: 0, source: values.length ? "work_schedule_by_days,description" : "description", evidence: excerpt(description) };
     if (values.length) {
       const actual = values.map(canonicalSchedule);
       if (actual.some((value) => value === undefined)) return { state: "unknown", confidence: 0, source: "work_schedule_by_days", evidence: excerpt(values.join(", ")) };

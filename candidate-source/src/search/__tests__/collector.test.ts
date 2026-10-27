@@ -104,6 +104,111 @@ describe("deep collector coverage and resume", () => {
     expect(resumed.manifest.gaps.some((gap) => gap.code === "interrupted_http_unknown")).toBe(true);
   });
 
+  it("retries a failed 5xx partition only after explicit resume and clears its resolved gap", async () => {
+    const base = plan();
+    let attempts = 0;
+    const get = vi.fn(async (_path: string, options?: { budget?: HhRequestBudget }) => {
+      if (options?.budget) { assertHhBudgetAvailable(options.budget); recordHhRequestAttempt(options.budget, options.budget.requests > 0); recordHhResponseBytes(options.budget, 10); }
+      if (attempts++ === 0) throw new HhApiError(503, "Unavailable");
+      return page(0, []);
+    });
+    const first = await collectSearch(base, { get: get as never });
+    expect(first.status).toBe("PARTIAL");
+    expect(first.checkpoint.partitions[0]).toMatchObject({ status: "failed", page: 0, first_page_done: false });
+    expect(first.checkpoint.counters.requests).toBe(1);
+    const resumed = await collectSearch(base, { checkpoint: first.checkpoint, get: get as never });
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(resumed.status).toBe("COMPLETE");
+    expect(resumed.checkpoint.counters.requests).toBe(2);
+    expect(resumed.checkpoint.counters.retries).toBeGreaterThanOrEqual(first.checkpoint.counters.retries);
+    expect(resumed.checkpoint.counters.bytes).toBeGreaterThanOrEqual(first.checkpoint.counters.bytes);
+    expect(resumed.manifest.gaps).toEqual([]);
+  });
+
+  it("resumes a transient continuation failure at its saved page without losing earlier hits", async () => {
+    const base = plan();
+    let continuationAttempts = 0;
+    const get = vi.fn(async (path: string, options?: { budget?: HhRequestBudget }) => {
+      if (options?.budget) { assertHhBudgetAvailable(options.budget); recordHhRequestAttempt(options.budget, options.budget.requests > 0); recordHhResponseBytes(options.budget, 10); }
+      const pageNo = Number(new URL(path, "https://api.hh.ru").searchParams.get("page") ?? 0);
+      if (pageNo === 0) return page(101, Array.from({ length: 100 }, (_, i) => String(100 + i)), 2);
+      if (continuationAttempts++ === 0) throw new HhApiError(500, "Server Error");
+      return page(101, ["999"], 2);
+    });
+    const first = await collectSearch(base, { get: get as never });
+    expect(first.items).toHaveLength(100);
+    expect(first.checkpoint.partitions[0]).toMatchObject({ status: "failed", first_page_done: true, page: 1 });
+    const resumed = await collectSearch(base, { checkpoint: first.checkpoint, get: get as never });
+    expect(get.mock.calls).toHaveLength(3);
+    expect(resumed.items).toHaveLength(101);
+    expect(resumed.items.some((item) => item.id === "999")).toBe(true);
+    expect(resumed.checkpoint.counters.requests).toBe(3);
+    expect(resumed.status).toBe("COMPLETE");
+  });
+
+  it("resumes a transport failure but leaves forbidden and exhausted-budget partitions terminal", async () => {
+    const base = plan();
+    let networkAttempts = 0;
+    const networkGet = vi.fn(async (_path: string, options?: { budget?: HhRequestBudget }) => {
+      if (options?.budget) { assertHhBudgetAvailable(options.budget); recordHhRequestAttempt(options.budget, options.budget.requests > 0); }
+      if (networkAttempts++ === 0) throw new TypeError("network connection reset");
+      return page(0, []);
+    });
+    const networkFailure = await collectSearch(base, { get: networkGet as never });
+    const networkResumed = await collectSearch(base, { checkpoint: networkFailure.checkpoint, get: networkGet as never });
+    expect(networkResumed.status).toBe("COMPLETE");
+    expect(networkGet).toHaveBeenCalledTimes(2);
+
+    const forbiddenGet = injected(() => { throw new HhApiError(403, "Forbidden"); });
+    const forbidden = await collectSearch(base, { get: forbiddenGet.get as never });
+    const forbiddenResumed = await collectSearch(base, { checkpoint: forbidden.checkpoint, get: forbiddenGet.get as never });
+    expect(forbiddenGet.get).toHaveBeenCalledTimes(1);
+    expect(forbiddenResumed.checkpoint.partitions[0]?.status).toBe("failed");
+
+    const oneRequest = planSearch({ native: { date_from: "2026-01-01T00:00:00Z", date_to: "2026-01-01T00:05:00Z" }, limits: { ...limits, max_requests: 1 } }, Date.UTC(2026, 0, 2));
+    const exhaustedGet = injected((path) => {
+      if (new URL(path, "https://api.hh.ru").searchParams.get("page") === "1") return page(101, [], 2);
+      return page(101, Array.from({ length: 100 }, (_, i) => String(2000 + i)), 2);
+    });
+    const exhausted = await collectSearch(oneRequest, { get: exhaustedGet.get as never });
+    const callsAfterExhaustion = exhaustedGet.get.mock.calls.length;
+    const exhaustedResumed = await collectSearch(oneRequest, { checkpoint: exhausted.checkpoint, get: exhaustedGet.get as never });
+    expect(exhausted.checkpoint.partitions[0]?.status).toBe("failed");
+    expect(exhaustedResumed.checkpoint.partitions[0]?.status).toBe("failed");
+    expect(exhaustedResumed.checkpoint.counters.requests).toBe(1);
+    expect(exhaustedGet.get).toHaveBeenCalledTimes(callsAfterExhaustion);
+
+    const lastAttemptPlan = planSearch({ native: { date_from: "2026-01-01T00:00:00Z", date_to: "2026-01-01T00:05:00Z" }, limits: { ...limits, max_requests: 1 } }, Date.UTC(2026, 0, 2));
+    const lastAttemptGet = injected(() => { throw new HhApiError(503, "Unavailable"); });
+    const lastAttempt = await collectSearch(lastAttemptPlan, { get: lastAttemptGet.get as never });
+    const callsAtCap = lastAttemptGet.get.mock.calls.length;
+    const lastAttemptResumed = await collectSearch(lastAttemptPlan, { checkpoint: lastAttempt.checkpoint, get: lastAttemptGet.get as never });
+    expect(lastAttemptResumed.checkpoint.partitions[0]?.status).toBe("failed");
+    expect(lastAttemptResumed.checkpoint.counters.requests).toBe(1);
+    expect(lastAttemptGet.get).toHaveBeenCalledTimes(callsAtCap);
+  });
+
+  it.each([
+    ["script", `<script>Linux is required.</script><p>Public description has no technology requirement.</p>`],
+    ["style", `<style>Linux is required.</style><p>Public description has no technology requirement.</p>`],
+  ])("filters hidden %s text through canonical HTML cleanup", async (_kind, description) => {
+    const filtered = planSearch({ native: {}, post_filters: [{ rule: "required_technology", value: "Linux" }], details: "none", limits: { ...limits, max_detail_fetches: 1 } }, Date.UTC(2026, 0, 2));
+    const { get } = injected((path) => path.startsWith("/vacancies/") ? { id: "42", description } : page(1, ["42"]));
+    const result = await collectSearch(filtered, { get: get as never });
+    expect(result.items[0]?.filtering?.state).toBe("unknown");
+    expect(result.items[0]?.filtering?.rules[0]?.state).toBe("unknown");
+    expect(result.items[0]?.raw_detail).toBeUndefined();
+  });
+
+  it("uses visible HTML as filter evidence and preserves original detail HTML", async () => {
+    const filtered = planSearch({ native: {}, post_filters: [{ rule: "required_technology", value: "Linux" }], details: "full", limits: { ...limits, max_detail_fetches: 1 } }, Date.UTC(2026, 0, 2));
+    const description = `<p>Linux is required for this role.</p>`;
+    const { get } = injected((path) => path.startsWith("/vacancies/") ? { id: "42", description } : page(1, ["42"]));
+    const result = await collectSearch(filtered, { get: get as never });
+    expect(result.items[0]?.filtering?.rules[0]?.state).toBe("match");
+    expect(result.items[0]?.raw_detail?.description).toBe(description);
+  });
+
   it("requires full cards for postfilters even when raw details are not retained", async () => {
     const filtered = planSearch({ native: {}, post_filters: [{ rule: "no_mandatory_phone_calls" }], details: "none", limits: { ...limits, max_detail_fetches: 1 } }, Date.UTC(2026, 0, 2));
     const { get } = injected((path) => path.startsWith("/vacancies/") ? { id: "42", description: "Contact the team." } : page(1, ["42"]));
