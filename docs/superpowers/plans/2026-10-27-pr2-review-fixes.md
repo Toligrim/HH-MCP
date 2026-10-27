@@ -69,5 +69,5 @@
 - [x] Run `npm ci`, `npm run typecheck`, `npm run lint`, `npm test`, `npm run build`, `git diff --check`; audit runtime and full tree, listing remaining advisories and any audit-service failure accurately.
 - [x] Validate updated SDK transport/input limits and CLI checkpoint/resume with compiled runtime where unit coverage does not suffice. No mass/live production probes.
 - [x] Update `candidate-source/docs/issue-1-verification.md` and relevant operator limits, recording real results and historical evidence separately.
-- [ ] Commit and push to the same feature branch. Fetch live PR exact HEAD and independently review actual diff from base; fix confirmed findings in the same branch and re-review the new HEAD.
-- [ ] Update existing PR body with final SHA/evidence; keep draft. Confirm protected paths/base unchanged, clean tree, MERGE:NO and DEPLOY:NO.
+- [x] Commit and push to the same feature branch. Fetch live PR exact HEAD and independently review actual diff from base; fix confirmed findings in the same branch and re-review the new HEAD.
+- [x] Update existing PR body with final SHA/evidence; keep draft. Confirm protected paths/base unchanged, clean tree, MERGE:NO and DEPLOY:NO.
