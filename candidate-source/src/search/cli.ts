@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
@@ -14,6 +15,7 @@ const INPUT_MAX = 128 * 1024 * 1024;
 type CliDependencies = {
   get?: typeof hhGet;
   lockPath?: string;
+  flockPath?: string;
   signal?: AbortSignal;
   atomicWrite?: (path: string, data: string) => Promise<void>;
 };
@@ -54,17 +56,18 @@ async function canonicalFilePath(input: string): Promise<{ path: string; exists:
   }
 }
 
-async function preflightPaths(specArg: string, checkpointArg: string, resultArg: string | undefined, lockArg: string): Promise<{ spec: string; checkpoint: string; result?: string; lock: string }> {
-  const [spec, checkpoint, result, lock] = await Promise.all([
-    canonicalFilePath(specArg), canonicalFilePath(checkpointArg), resultArg ? canonicalFilePath(resultArg) : Promise.resolve(undefined), canonicalFilePath(lockArg),
+async function preflightPaths(specArg: string, checkpointArg: string, resultArg: string | undefined, lockArg: string): Promise<{ spec: string; checkpoint: string; result?: string; lock: string; guard: string }> {
+  const guardArg = `${resolve(lockArg)}.guard`;
+  const [spec, checkpoint, result, lock, guard] = await Promise.all([
+    canonicalFilePath(specArg), canonicalFilePath(checkpointArg), resultArg ? canonicalFilePath(resultArg) : Promise.resolve(undefined), canonicalFilePath(lockArg), canonicalFilePath(guardArg),
   ]);
-  const paths = [spec.path, checkpoint.path, ...(result ? [result.path] : []), lock.path];
+  const paths = [spec.path, checkpoint.path, ...(result ? [result.path] : []), lock.path, guard.path];
   if (new Set(paths).size !== paths.length) throw new Error("spec, checkpoint, result, and lock paths must not collide");
   if (!spec.exists) throw new Error("spec file does not exist");
   if (spec.exists && (await stat(spec.path)).size > SPEC_MAX) throw new Error("spec exceeds 64 KiB");
   if (checkpoint.exists && (await stat(checkpoint.path)).size > INPUT_MAX) throw new Error("checkpoint exceeds 128 MiB");
   if (lock.exists) { /* lock acquisition validates the owner and stale state */ }
-  return { spec: spec.path, checkpoint: checkpoint.path, ...(result ? { result: result.path } : {}), lock: lock.path };
+  return { spec: spec.path, checkpoint: checkpoint.path, ...(result ? { result: result.path } : {}), lock: lock.path, guard: guard.path };
 }
 
 export async function atomicWriteFile(path: string, data: string, replace: typeof rename = rename): Promise<void> {
@@ -112,6 +115,40 @@ async function readLock(path: string): Promise<{ owner: LockOwner; info: Awaited
   return { owner: owner as LockOwner, info };
 }
 function sameFile(a: { dev: number | bigint; ino: number | bigint }, b: { dev: number | bigint; ino: number | bigint }): boolean { return a.dev === b.dev && a.ino === b.ino; }
+async function acquireKernelGuard(path: string, flockPath = "flock"): Promise<Awaited<ReturnType<typeof open>>> {
+  if (process.platform !== "linux" || !process.getuid) throw new Error("local search collection requires Linux and util-linux flock");
+  let handle: Awaited<ReturnType<typeof open>>;
+  try { handle = await open(path, constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0), 0o600); }
+  catch { throw new Error("cannot open the private search collection guard (symlink or filesystem error)"); }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o077) !== 0) throw new Error("search collection guard is not a private regular file owned by this user");
+    await new Promise<void>((resolveGuard, rejectGuard) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) rejectGuard(error); else resolveGuard();
+      };
+      const child = spawn(flockPath, ["-x", "-n", "-E", "75", "3"], { stdio: ["ignore", "ignore", "ignore", handle.fd] });
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        finish(new Error("flock helper timed out while acquiring the search collection guard"));
+      }, 3_000);
+      child.once("error", () => finish(new Error("cannot run util-linux flock; install/enable flock before local collection")));
+      child.once("exit", (code) => {
+        if (code === 0) finish();
+        else if (code === 75) finish(new Error("search collection is busy (another local job owns the guard)"));
+        else finish(new Error(`flock failed while acquiring the search collection guard (exit ${code ?? "unknown"})`));
+      });
+    });
+    return handle;
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
 async function acquireLock(path: string): Promise<() => Promise<void>> {
   const owner: LockOwner = { uid: process.getuid?.() ?? -1, pid: process.pid, nonce: randomBytes(16).toString("hex") };
   const contents = JSON.stringify(owner);
@@ -152,16 +189,9 @@ async function acquireLock(path: string): Promise<() => Promise<void>> {
         else throw new Error("cannot validate search collection lock owner");
       }
       if (alive) throw new Error("search collection is busy (another local job owns the lock)");
-      const tomb = `${path}.stale-${process.pid}-${randomBytes(6).toString("hex")}`;
-      await rename(path, tomb);
-      const moved = await lstat(tomb);
-      if (!sameFile(moved, existing.info)) {
-        try { await lstat(path); } catch (restore) {
-          if ((restore as NodeJS.ErrnoException).code === "ENOENT") await rename(tomb, path).catch(() => undefined);
-        }
-        throw new Error("search collection lock changed during stale recovery; retry the command");
-      }
-      await unlink(tomb);
+      const current = await readLock(path);
+      if (!sameFile(current.info, existing.info) || current.owner.pid !== existing.owner.pid || current.owner.nonce !== existing.owner.nonce) throw new Error("search collection lock changed during guarded stale recovery; retry the command");
+      await unlink(path);
     }
   }
   throw new Error("could not acquire search collection lock");
@@ -202,16 +232,19 @@ export async function runSearchCollect(args: string[], dependencies: CliDependen
 
   const frozenAt = checkpoint ? readFrozenAt(checkpoint) : Date.now();
   const plan = planSearch(defaults(specValue as Record<string, unknown>), frozenAt);
-  const release = await acquireLock(paths.lock);
+  const guard = await acquireKernelGuard(paths.guard, dependencies.flockPath);
   const atomicWrite = dependencies.atomicWrite ?? atomicWriteFile;
   try {
-    const result = await collectSearch(plan, {
-      ...(checkpoint ? { checkpoint } : {}), ...(dependencies.get ? { get: dependencies.get } : {}), ...(dependencies.signal ? { signal: dependencies.signal } : {}),
-      onCheckpoint: async (state) => atomicWrite(paths.checkpoint, JSON.stringify(state)),
-    });
-    if (paths.result) await atomicWrite(paths.result, JSON.stringify({ status: result.status, manifest: result.manifest, items: result.items }));
-    return result;
-  } finally { await release(); }
+    const release = await acquireLock(paths.lock);
+    try {
+      const result = await collectSearch(plan, {
+        ...(checkpoint ? { checkpoint } : {}), ...(dependencies.get ? { get: dependencies.get } : {}), ...(dependencies.signal ? { signal: dependencies.signal } : {}),
+        onCheckpoint: async (state) => atomicWrite(paths.checkpoint, JSON.stringify(state)),
+      });
+      if (paths.result) await atomicWrite(paths.result, JSON.stringify({ status: result.status, manifest: result.manifest, items: result.items }));
+      return result;
+    } finally { await release(); }
+  } finally { await guard.close(); }
 }
 
 async function lstatOrMissing(path: string): Promise<boolean> {

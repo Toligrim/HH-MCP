@@ -11,13 +11,16 @@ Recorded 2026-10-27 in `candidate-source/`:
 | `npm ci` | PASS | Clean dependency install completed; package lock and dependency resolutions unchanged. |
 | `npm run typecheck` | PASS | `tsc --noEmit`, exit 0. |
 | `npm run lint` | PASS | `eslint src`, exit 0. |
-| `npm test` | PASS | 15 files, 249 tests passed. Test stderr contains expected retry/captcha fixtures. |
+| `npm test` at initial Task 6 commit | PASS | 15 files, 249 tests passed before the kernel-guard fix round. Test stderr contains expected retry/captcha fixtures. |
 | `npm run build` | PASS | TypeScript build completed, exit 0. |
-| Compiled CLI runtime | PASS | Copied `dist/` into a temporary path containing spaces with only production `zod` available, then ran the compiled `cli.js --unsupported`; it loaded and rejected the argument before any HH request. |
+| Compiled CLI runtime at initial Task 6 commit | PASS | Copied `dist/` into a temporary path containing spaces with only production `zod` available, then ran the compiled `cli.js --unsupported`; it loaded and rejected the argument before any HH request. |
 | `git diff --check` | PASS | No whitespace errors. |
 | `npm audit --json` | FAIL | npm exits 1 for the existing advisories. Current: 20 total (1 low, 4 moderate, 12 high, 3 critical). Baseline `/tmp/hh-mcp-baseline-audit.json`: same counts and the same 104 advisory identities across the same 20 packages; no added, removed, or changed advisory identities. No audit fix or dependency resolution change was made. Current JSON: `/tmp/hh-mcp-current-audit-task6.json`. |
+| `flock --version` | PASS | `flock from util-linux 2.39.3`; Linux and util-linux `flock` are now explicit CLI prerequisites. |
+| `npm test -- src/search/__tests__/cli.test.ts` after fix round 1 | PASS | 1 file, 20 tests passed, including guard-held stale metadata, concurrent stale-owner starts, missing flock, and guard path safety. |
+| Full suite after fix round 1 | SKIP | Awaiting coordinator's final full verification after independent review. |
 
-The focused CLI suite uses temporary local files and injected/mocked HH reads only. It covers pre-fetch checkpoint persistence, failure while replacing a prior checkpoint, cancellation and resume with frozen time and cumulative counters, malformed/incompatible checkpoints, path collisions and symlinks, live and stale lock owners, cleanup, and spec byte limits. No live HH request was made for this verification.
+The focused CLI suite uses temporary local files and injected/mocked HH reads only. It covers pre-fetch checkpoint persistence, failure while replacing a prior checkpoint, cancellation and resume with frozen time and cumulative counters, malformed/incompatible checkpoints, path collisions and symlinks, live and stale lock owners, cleanup, and spec byte limits. Fix round 1 obtains a persistent mode-0600 guard via inherited descriptor and keeps it through job cleanup; the empty guard file remains after a run while the primary PID/nonce lock is removed. No live HH request was made for this verification.
 
 ## Live HH evidence
 

@@ -1,4 +1,6 @@
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { constants } from "node:fs";
+import { mkdtemp, open, readFile, readdir, rm, symlink, writeFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +18,13 @@ async function setup() {
   return { dir, spec, checkpoint, lock };
 }
 const emptyPage = vi.fn(async () => ({ found: 0, pages: 0, items: [] }));
+function flockDescriptor(fd: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("flock", ["-x", "-n", "-E", "75", "3"], { stdio: ["ignore", "ignore", "ignore", fd] });
+    child.once("error", reject);
+    child.once("exit", (code) => resolve(code ?? -1));
+  });
+}
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -130,6 +139,8 @@ describe("local search collection CLI", () => {
     release();
     await inFlight;
     await expect(stat(first.lock)).rejects.toThrow();
+    const guardInfo = await stat(`${first.lock}.guard`);
+    expect(guardInfo.mode & 0o777).toBe(0o600);
   });
 
   it("recovers a well-formed lock only when its owner PID is dead", async () => {
@@ -138,6 +149,89 @@ describe("local search collection CLI", () => {
     const result = await runSearchCollect(["--spec", paths.spec, "--checkpoint", paths.checkpoint], { lockPath: paths.lock, get: emptyPage as never });
     expect(result.status).toBe("COMPLETE");
     await expect(stat(paths.lock)).rejects.toThrow();
+  });
+
+  it.skipIf(process.platform !== "linux")("does not inspect or displace stale metadata while another process holds the persistent guard", async () => {
+    const paths = await setup();
+    const guardPath = `${paths.lock}.guard`;
+    const stale = JSON.stringify({ uid: process.getuid?.() ?? -1, pid: 2_147_483_647, nonce: "stale-owner" });
+    await writeFile(paths.lock, stale, { mode: 0o600 });
+    const before = await stat(paths.lock);
+    const guard = await open(guardPath, constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0), 0o600);
+    expect(await flockDescriptor(guard.fd)).toBe(0);
+    const get = vi.fn(emptyPage);
+    try {
+      await expect(runSearchCollect(["--spec", paths.spec, "--checkpoint", paths.checkpoint], { lockPath: paths.lock, get: get as never })).rejects.toThrow(/busy/i);
+      expect(get).not.toHaveBeenCalled();
+      const after = await stat(paths.lock);
+      expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.dev, ino: before.ino });
+      expect(await readFile(paths.lock, "utf8")).toBe(stale);
+    } finally { await guard.close(); }
+  });
+
+  it.skipIf(process.platform !== "linux")("serializes concurrent starts on stale metadata and preserves the new owner's record", async () => {
+    const paths = await setup();
+    const secondSpec = join(paths.dir, "second.json");
+    const secondCheckpoint = join(paths.dir, "second-checkpoint.json");
+    await writeFile(secondSpec, JSON.stringify(specValue));
+    await writeFile(paths.lock, JSON.stringify({ uid: process.getuid?.() ?? -1, pid: 2_147_483_647, nonce: "stale-owner" }), { mode: 0o600 });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const firstGet = vi.fn(async () => { await held; return { found: 0, pages: 0, items: [] }; });
+    const first = runSearchCollect(["--spec", paths.spec, "--checkpoint", paths.checkpoint], { lockPath: paths.lock, get: firstGet as never });
+    for (let i = 0; i < 100; i++) {
+      try {
+        const owner = JSON.parse(await readFile(paths.lock, "utf8"));
+        if (owner.pid === process.pid && owner.nonce !== "stale-owner") break;
+      } catch { /* the first invocation is acquiring the guarded lock */ }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const ownerText = await readFile(paths.lock, "utf8");
+    const owner = JSON.parse(ownerText);
+    expect(owner.pid).toBe(process.pid);
+    expect(owner.nonce).not.toBe("stale-owner");
+    const ownerInfo = await stat(paths.lock);
+    const secondGet = vi.fn(emptyPage);
+    await expect(runSearchCollect(["--spec", secondSpec, "--checkpoint", secondCheckpoint], { lockPath: paths.lock, get: secondGet as never })).rejects.toThrow(/busy/i);
+    expect(secondGet).not.toHaveBeenCalled();
+    expect(await readFile(paths.lock, "utf8")).toBe(ownerText);
+    const after = await stat(paths.lock);
+    expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: ownerInfo.dev, ino: ownerInfo.ino });
+    release();
+    await first;
+    expect(firstGet).toHaveBeenCalledTimes(1);
+  });
+
+  it.skipIf(process.platform !== "linux")("fails clearly without flock before touching stale primary metadata or making requests", async () => {
+    const paths = await setup();
+    const stale = JSON.stringify({ uid: process.getuid?.() ?? -1, pid: 2_147_483_647, nonce: "stale-owner" });
+    await writeFile(paths.lock, stale, { mode: 0o600 });
+    const get = vi.fn(emptyPage);
+    await expect(runSearchCollect(["--spec", paths.spec, "--checkpoint", paths.checkpoint], {
+      lockPath: paths.lock, get: get as never, flockPath: join(paths.dir, "missing-flock"),
+    })).rejects.toThrow(/flock/i);
+    expect(get).not.toHaveBeenCalled();
+    expect(await readFile(paths.lock, "utf8")).toBe(stale);
+  });
+
+  it("rejects collisions with the persistent guard path before writing it", async () => {
+    const paths = await setup();
+    const lockPath = join(paths.dir, "primary");
+    const guardPath = `${lockPath}.guard`;
+    const get = vi.fn(emptyPage);
+    await expect(runSearchCollect(["--spec", paths.spec, "--checkpoint", guardPath], { lockPath, get: get as never })).rejects.toThrow(/collid/i);
+    await expect(stat(guardPath)).rejects.toThrow();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("rejects a symlink at the persistent guard path before any HH read", async () => {
+    const paths = await setup();
+    const target = join(paths.dir, "guard-target");
+    await writeFile(target, "not a guard");
+    await symlink(target, `${paths.lock}.guard`);
+    const get = vi.fn(emptyPage);
+    await expect(runSearchCollect(["--spec", paths.spec, "--checkpoint", paths.checkpoint], { lockPath: paths.lock, get: get as never })).rejects.toThrow(/symlink/i);
+    expect(get).not.toHaveBeenCalled();
   });
 
   it("creates private checkpoint files and rejects unsupported flags before collection", async () => {

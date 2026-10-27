@@ -101,7 +101,7 @@ Authentication is provided by the surrounding OAuth proxy (`auth_mode: external_
 
 ## Explicit local collection and recovery
 
-This is an operator-invoked local CLI in the development candidate. Build first with `npm ci && npm run build`; the compiled command itself runs on Node.js without devDependencies:
+This is an operator-invoked local CLI in the development candidate. It requires Linux and the installed util-linux `flock` command; it fails closed if either is unavailable. Build first with `npm ci && npm run build`; the compiled command itself runs on Node.js without devDependencies:
 
 ```bash
 npm run search:collect -- --spec ./search-spec.json --checkpoint ./search-checkpoint.json
@@ -112,4 +112,4 @@ The spec is local JSON (maximum 64 KiB). The checkpoint is an explicit local pat
 
 When omitted from the spec, individual limits default to `max_requests: 500`, `max_items: 20000`, `max_duration_sec: 600`, `max_bytes: 67108864`, and `max_detail_fetches: 20000`. Explicit smaller values are preserved. Planner hard maxima are respectively 1000, 50000, 1800 seconds, 134217728 bytes, and 50000 detail fetches.
 
-The local lock allows one CLI job per OS user across all checkpoint names, with validated stale-lock recovery after a process crash. The request limiter is per process: do not run multiple CLI jobs, or a CLI job alongside an MCP server process, as a coordinated multi-process deployment. This command is never exposed as an MCP start-job action and accepts no paths through MCP. The result file is local operator output, not a server export/download feature. Server jobs, exports, and analytics remain deferred.
+The CLI serializes lock acquisition, stale-owner recovery, and the complete job with a kernel `flock` on a private persistent sibling file named `<lock>.guard`. The guard file is mode `0600` and intentionally remains after a run; closing the descriptor releases the kernel lock, including after a crash. The primary PID/nonce lock is removed after normal completion or cancellation. The request limiter is per process: do not run a CLI job alongside an MCP server process as a coordinated multi-process deployment. This command is never exposed as an MCP start-job action and accepts no paths through MCP. The result file is local operator output, not a server export/download feature. Server jobs, exports, and analytics remain deferred.
