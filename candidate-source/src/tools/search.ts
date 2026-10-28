@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import { HhApiError } from "../client.js";
-import { createHhRequestBudget } from "../requestBudget.js";
+import { createHhRequestBudget, HhBudgetError } from "../requestBudget.js";
 import { explainVacancyQuery, searchVacanciesSchema } from "../search/query.js";
 import { resolveSearchDictionary, resolveSearchDictionarySchema } from "../search/dictionaries.js";
 import { searchSpecObjectSchema, planSearch } from "../search/planner.js";
@@ -78,13 +78,21 @@ export async function handleExplainSearch(input: unknown): Promise<string> {
 
 export async function handleResolveSearchDictionary(input: unknown, extra?: McpExtra): Promise<string> {
   const parsed = resolveSearchDictionarySchema.parse(input);
-  const budget = createHhRequestBudget({ max_requests: 1, max_duration_sec: 20, max_bytes: 2 * 1024 * 1024 });
+  const budget = createHhRequestBudget({
+    max_requests: 1,
+    max_duration_sec: 20,
+    max_bytes: parsed.dictionary === "areas" ? 4 * 1024 * 1024 : 2 * 1024 * 1024,
+  });
   let result: unknown;
   try {
     result = await resolveSearchDictionary(parsed, { request: { budget, signal: extra?.signal } });
   } catch (error) {
+    if (error instanceof HhBudgetError) throw error;
     if (error instanceof HhApiError) {
       throw new SearchToolError("hh_api_error", "HH dictionary request failed.", error.status === 429 || error.status >= 500, error.status);
+    }
+    if (error instanceof SyntaxError) {
+      throw new SearchToolError("search_request_failed", "HH dictionary response was not valid JSON.");
     }
     if (error instanceof Error) throw new Error(error.name === "HhApiError" ? "HH dictionary request failed." : error.message);
     throw new Error("HH dictionary request failed.");

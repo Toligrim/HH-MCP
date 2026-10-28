@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { configureTools, createServer } from "../../index.js";
+import { __resetRateLimitForTests } from "../../client.js";
 
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
@@ -24,6 +25,8 @@ const silentEnv = () => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
+  __resetRateLimitForTests();
   configureTools({ env: {} });
   delete process.env.HH_ACCESS_TOKEN;
 });
@@ -141,6 +144,82 @@ describe("search tools over the MCP transport", () => {
       expect(error).toMatchObject({ code: "hh_api_error", retryable: false, status: 400 });
       expect(text).not.toContain("upstream detail");
     } finally { await close(); }
+  });
+
+  it("resolves areas from an upstream catalogue larger than 2 MiB and compacts it for MCP", async () => {
+    silentEnv();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2040-01-01T00:00:00.000Z"));
+    const payload = JSON.stringify([{ id: 1, name: "Москва", fixture_padding: "x".repeat(2_650_000) }]);
+    expect(Buffer.byteLength(payload, "utf8")).toBeGreaterThan(2 * 1024 * 1024);
+    expect(Buffer.byteLength(payload, "utf8")).toBeLessThan(4 * 1024 * 1024);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(payload, { headers: { "content-type": "application/json" } })));
+    configureTools({ allow: "search", env: {} });
+    const { client, close } = await connect();
+    try {
+      const result = await client.callTool({ name: "resolve_search_dictionary", arguments: { dictionary: "areas", text: "Москва" } });
+      expect(result.isError).not.toBe(true);
+      const text = (result.content as { text: string }[])[0]!.text;
+      expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(64 * 1024);
+      expect(JSON.parse(text)).toMatchObject({ dictionary: "areas", status: "exact", id: "1", name: "Москва" });
+    } finally { await close(); }
+  });
+
+  it("returns structured byte-budget errors above 4 MiB for areas and above 2 MiB for other dictionaries", async () => {
+    silentEnv();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2041-01-01T00:00:00.000Z"));
+    let payload = JSON.stringify([{ id: 1, name: "Москва", fixture_padding: "x".repeat(4 * 1024 * 1024) }]);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(payload, { headers: { "content-type": "application/json" } })));
+    configureTools({ allow: "search", env: {} });
+    const { client, close } = await connect();
+    try {
+      const areas = await client.callTool({ name: "resolve_search_dictionary", arguments: { dictionary: "areas", text: "Москва" } });
+      expect(areas.isError).toBe(true);
+      expect(JSON.parse((areas.content as { text: string }[])[0]!.text.replace(/^ERROR:\s*/, ""))).toMatchObject({ code: "byte_budget", retryable: false });
+
+      payload = JSON.stringify({ areas: [], fixture_padding: "x".repeat(2 * 1024 * 1024) });
+      const metro = await client.callTool({ name: "resolve_search_dictionary", arguments: { dictionary: "metro", text: "Москва" } });
+      expect(metro.isError).toBe(true);
+      expect(JSON.parse((metro.content as { text: string }[])[0]!.text.replace(/^ERROR:\s*/, ""))).toMatchObject({ code: "byte_budget", retryable: false });
+    } finally { await close(); }
+  });
+
+  it("settles dictionary cancellation and handles invalid HH JSON safely", async () => {
+    silentEnv();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2042-01-01T00:00:00.000Z"));
+    let observedSignal: AbortSignal | undefined;
+    const fetch = vi.fn((_input: unknown, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      observedSignal = init?.signal as AbortSignal;
+      observedSignal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetch);
+    configureTools({ allow: "search", env: {} });
+    const { client, close } = await connect();
+    const controller = new AbortController();
+    try {
+      const pending = client.callTool({ name: "resolve_search_dictionary", arguments: { dictionary: "areas", text: "Москва" } }, undefined, { signal: controller.signal }).catch((error) => error);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+      controller.abort();
+      const cancelled = await pending;
+      expect(cancelled).toBeInstanceOf(Error);
+      expect(observedSignal?.aborted).toBe(true);
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify([{ id: 1, name: "Москва" }]), { headers: { "content-type": "application/json" } })));
+      const retry = await client.callTool({ name: "resolve_search_dictionary", arguments: { dictionary: "areas", text: "Москва" } });
+      expect(retry.isError).not.toBe(true);
+    } finally { await close(); }
+
+    vi.setSystemTime(new Date("2042-01-01T02:00:00.000Z"));
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("<PRIVATE_BODY_DO_NOT_ECHO_91A3", { headers: { "content-type": "application/json" } })));
+    const retry = await connect();
+    try {
+      const invalidJson = await retry.client.callTool({ name: "resolve_search_dictionary", arguments: { dictionary: "areas", text: "Москва" } });
+      expect(invalidJson.isError).toBe(true);
+      const text = (invalidJson.content as { text: string }[])[0]!.text;
+      expect(text).toContain('"code":"search_request_failed"');
+      expect(text).not.toContain("PRIVATE");
+    } finally { await retry.close(); }
   });
 
   it("applies omitted MCP limits and reports the actual active inventory", async () => {
