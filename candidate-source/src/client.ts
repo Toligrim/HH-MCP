@@ -22,6 +22,14 @@ import {
 } from "./resumeBudget.js";
 import { logHhEvent, logHhRequest } from "./requestLog.js";
 import { getInstanceLabel } from "./instance.js";
+import {
+  assertHhBudgetAvailable,
+  assertHhRequestAvailable,
+  HhBudgetError,
+  recordHhRequestAttempt,
+  recordHhResponseBytes,
+  type HhRequestBudget,
+} from "./requestBudget.js";
 
 export { HhApiError, HhAccessError, HhNotFoundError } from "./hhErrors.js";
 export { getResumeBudgetHealth } from "./resumeBudget.js";
@@ -45,16 +53,85 @@ const RATE_WINDOW = 1000;
 const timestamps: number[] = [];
 let rateLimitTail: Promise<void> = Promise.resolve();
 
-async function waitForRateLimit(): Promise<void> {
+export function __resetRateLimitForTests(): void {
+  timestamps.length = 0;
+  rateLimitTail = Promise.resolve();
+}
+
+function budgetAbortError(budget?: HhRequestBudget, signal?: AbortSignal): Error {
+  if (signal?.aborted) return new HhBudgetError("cancelled");
+  if (budget && Date.now() >= budget.deadline) {
+    return new HhBudgetError("duration_budget");
+  }
+  return Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+}
+
+async function waitForBudget<T>(
+  promise: Promise<T>,
+  budget?: HhRequestBudget,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!budget && !signal) return promise;
+  if (budget) assertHhBudgetAvailable(budget, signal);
+  else if (signal?.aborted) throw new HhBudgetError("cancelled");
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abort: (() => void) | undefined;
+  const interrupted = new Promise<never>((_, reject) => {
+    abort = () => reject(budgetAbortError(budget, signal));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (budget) {
+      timer = setTimeout(() => reject(new HhBudgetError("duration_budget")), Math.max(0, budget.deadline - Date.now()));
+    }
+  });
+  try {
+    return await Promise.race([promise, interrupted]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (abort) signal?.removeEventListener("abort", abort);
+  }
+}
+
+async function waitForDelay(
+  requestedMs: number,
+  budget?: HhRequestBudget,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!budget && !signal) {
+    if (requestedMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, requestedMs));
+    return;
+  }
+  if (budget) assertHhBudgetAvailable(budget, signal);
+  else if (signal?.aborted) throw new HhBudgetError("cancelled");
+  const delay = Math.min(Math.max(0, requestedMs), budget ? Math.max(0, budget.deadline - Date.now()) : requestedMs);
+  if (delay > 0) {
+    let delayTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await waitForBudget(new Promise<void>((resolve) => {
+        delayTimer = setTimeout(resolve, delay);
+      }), budget, signal);
+    } finally {
+      if (delayTimer) clearTimeout(delayTimer);
+    }
+  }
+  if (budget) assertHhBudgetAvailable(budget, signal);
+  else if (signal?.aborted) throw new HhBudgetError("cancelled");
+}
+
+async function waitForRateLimit(budget?: HhRequestBudget, signal?: AbortSignal): Promise<void> {
+  if (budget) assertHhBudgetAvailable(budget, signal);
+  else if (signal?.aborted) throw new HhBudgetError("cancelled");
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
   const previous = rateLimitTail;
   rateLimitTail = previous.then(() => gate);
-  await previous;
+  let acquired = false;
 
   try {
+    await waitForBudget(previous, budget, signal);
+    acquired = true;
     const trim = (now: number) => {
       while (timestamps.length > 0 && timestamps[0]! <= now - RATE_WINDOW) {
         timestamps.shift();
@@ -66,19 +143,26 @@ async function waitForRateLimit(): Promise<void> {
       const oldest = timestamps[0]!;
       const waitMs = oldest + RATE_WINDOW - Date.now();
       if (waitMs > 0) {
-        await new Promise((r) => setTimeout(r, waitMs));
+        await waitForDelay(waitMs, budget, signal);
       }
       trim(Date.now());
     }
+    if (budget) assertHhBudgetAvailable(budget, signal);
+    else if (signal?.aborted) throw new HhBudgetError("cancelled");
     timestamps.push(Date.now());
   } finally {
-    release();
+    if (acquired) release();
+    else void previous.then(release);
   }
 }
 
 export type HhCost = "gated" | "normal";
 
 export interface HhGetOptions {
+  /** Shared request, time and response byte limits for this logical operation. */
+  budget?: HhRequestBudget;
+  /** Cancel limiter waits, network requests, retries and response reads. */
+  signal?: AbortSignal;
   /** Override auto path classification. */
   cost?: HhCost;
   resumeId?: string;
@@ -115,6 +199,54 @@ function resolveCost(path: string, opts?: HhGetOptions): HhCost {
   return isGatedPath(path) ? "gated" : "normal";
 }
 
+async function readBudgetedBody(
+  response: Response,
+  budget: HhRequestBudget,
+  signal: AbortSignal | undefined,
+  requestController: AbortController,
+): Promise<string> {
+  assertHhBudgetAvailable(budget, signal);
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const text = await waitForBudget(response.text(), budget, signal);
+    recordHhResponseBytes(budget, new TextEncoder().encode(text).byteLength);
+    return text;
+  }
+
+  try {
+    while (true) {
+      assertHhBudgetAvailable(budget, signal);
+      const { done, value } = await waitForBudget(reader.read(), budget, signal);
+      if (done) break;
+      recordHhResponseBytes(budget, value.byteLength);
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    assertHhBudgetAvailable(budget, signal);
+    return chunks.join("");
+  } catch (error) {
+    requestController.abort();
+    void reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function retryAfterDelay(value: string | null, fallbackMs: number, now: number): number {
+  if (value == null || value.trim() === "") return fallbackMs;
+  const trimmed = value.trim();
+  if (/^-\d/.test(trimmed)) return fallbackMs;
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    return Number.isFinite(seconds) ? seconds * 1000 : fallbackMs;
+  }
+  const date = Date.parse(trimmed);
+  return Number.isFinite(date) ? Math.max(0, date - now) : fallbackMs;
+}
+
 export async function hhGet(
   path: string,
   opts: HhGetOptions = {},
@@ -145,12 +277,27 @@ export async function hhGet(
     };
 
     // Every attempt (retries included) re-checks the breaker and takes a fresh slot.
+    if (opts.budget) {
+      assertHhBudgetAvailable(opts.budget, opts.signal);
+      assertHhRequestAvailable(opts.budget);
+    }
+    else if (opts.signal?.aborted) throw new HhBudgetError("cancelled");
     let slot: GatedSlot | null = null;
     if (gated) {
       ownsProbe = beforeGatedCall(env, { ownsProbe }) || ownsProbe;
-      slot = await acquireGatedSlot(env, getGatedPace(env));
+      const acquiringSlot = acquireGatedSlot(env, getGatedPace(env));
+      try {
+        slot = await waitForBudget(acquiringSlot, opts.budget, opts.signal);
+      } catch (error) {
+        void acquiringSlot.then((lateSlot) => lateSlot.release()).catch(() => undefined);
+        throw error;
+      }
       try {
         beforeGatedCall(env, { ownsProbe });
+        if (opts.budget) {
+          assertHhBudgetAvailable(opts.budget, opts.signal);
+          assertHhRequestAvailable(opts.budget);
+        }
       } catch (err) {
         await slot.release();
         throw err;
@@ -159,10 +306,19 @@ export async function hhGet(
 
     const started = Date.now();
     let delay: number | null = null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortFromCaller: (() => void) | undefined;
     try {
-      await waitForRateLimit();
+      if (opts.budget) assertHhRequestAvailable(opts.budget);
+      await waitForRateLimit(opts.budget, opts.signal);
+      if (opts.budget) assertHhBudgetAvailable(opts.budget, opts.signal);
+      if (opts.budget) assertHhRequestAvailable(opts.budget);
+      else if (opts.signal?.aborted) throw new HhBudgetError("cancelled");
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), TIMEOUT);
+      const remaining = opts.budget ? Math.max(0, opts.budget.deadline - Date.now()) : TIMEOUT;
+      timer = setTimeout(() => controller.abort(), Math.min(TIMEOUT, remaining));
+      abortFromCaller = () => controller.abort();
+      opts.signal?.addEventListener("abort", abortFromCaller, { once: true });
       const headers: Record<string, string> = {
         "HH-User-Agent": USER_AGENT,
         "User-Agent": USER_AGENT,
@@ -173,25 +329,35 @@ export async function hhGet(
         headers["Authorization"] = `Bearer ${token}`;
       }
 
-      let response: Response;
-      try {
-        response = await fetch(`${baseUrl(env)}${path}`, {
-          headers,
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
+      if (opts.budget) {
+        assertHhBudgetAvailable(opts.budget, opts.signal);
+        recordHhRequestAttempt(opts.budget, retry);
       }
+      const response = await fetch(`${baseUrl(env)}${path}`, {
+        headers,
+        signal: controller.signal,
+      });
       const ms = Date.now() - started;
 
       if (response.ok) {
-        const json = await response.json();
+        const json = opts.budget
+          ? JSON.parse(await readBudgetedBody(response, opts.budget, opts.signal, controller)) as unknown
+          : await response.json();
         if (gated) onGatedSuccess(env);
         log({ status: response.status, ms });
         return json;
       }
 
-      const body = await response.text().catch(() => "");
+      let body: string;
+      try {
+        body = opts.budget
+          ? await readBudgetedBody(response, opts.budget, opts.signal, controller)
+          : await response.text();
+      } catch (error) {
+        if (error instanceof HhBudgetError) throw error;
+        if (!opts.budget) body = "";
+        else throw error;
+      }
       const status = response.status;
       const requestId = parseHhErrorBody(body).requestId;
 
@@ -245,10 +411,11 @@ export async function hhGet(
           throw err;
         }
       } else if (status === 429 && attempt < MAX_RETRIES) {
-        const retryAfter = parseInt(response.headers.get("Retry-After") ?? "", 10);
-        delay = Number.isFinite(retryAfter)
-          ? retryAfter * 1000
-          : Math.min(1000 * 2 ** (attempt - 1), 8000);
+        delay = retryAfterDelay(
+          response.headers.get("Retry-After"),
+          Math.min(1000 * 2 ** (attempt - 1), 8000),
+          Date.now(),
+        );
         log({ status, ms, request_id: requestId, kind: "retrying" });
         console.error(
           `[hh-mcp] 429 rate limited, retry in ${delay}ms (${attempt}/${MAX_RETRIES})`,
@@ -270,6 +437,11 @@ export async function hhGet(
         throw err;
       }
     } catch (error) {
+      if (error instanceof HhBudgetError) throw error;
+      if (opts.signal?.aborted) throw new HhBudgetError("cancelled");
+      if (opts.budget && Date.now() >= opts.budget.deadline) {
+        throw new HhBudgetError("duration_budget");
+      }
       const isAbort = error instanceof Error && error.name === "AbortError";
       if (isAbort && attempt < MAX_RETRIES) {
         console.error(`[hh-mcp] Timeout, retry (${attempt}/${MAX_RETRIES})`);
@@ -281,11 +453,13 @@ export async function hhGet(
         throw error;
       }
     } finally {
+      if (timer) clearTimeout(timer);
+      if (abortFromCaller) opts.signal?.removeEventListener("abort", abortFromCaller);
       if (slot) await slot.release();
     }
 
     if (delay != null && delay > 0) {
-      await new Promise((r) => setTimeout(r, delay));
+      await waitForDelay(delay, opts.budget, opts.signal);
     }
   }
 }

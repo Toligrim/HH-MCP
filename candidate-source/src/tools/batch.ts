@@ -203,7 +203,7 @@ export const getResumesSchema = z.object({
     .optional()
     .describe("Legacy input: resume ids to fetch (1..50). Prefer items."),
   topics: z
-    .record(z.string())
+    .record(z.string(), z.string())
     .optional()
     .describe(
       "Legacy: map resume_id → topic_id. Every key must be one of resume_ids, otherwise the call fails before any request.",

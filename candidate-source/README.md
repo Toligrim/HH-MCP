@@ -273,3 +273,7 @@ MIT
 ---
 
 Репозиторий: [AndreyTepaykin/hh-mcp](https://github.com/AndreyTepaykin/hh-mcp) · npm: [@andrey-tepaykin/hh-mcp](https://www.npmjs.com/package/@andrey-tepaykin/hh-mcp)
+
+## Поисковый движок (development candidate)
+
+Локальный запуск bounded search и восстановление checkpoint описаны в [руководстве поискового движка](./docs/search-engine.md). После сборки `npm run search:collect -- --spec <localfile> --checkpoint <localfile>` запускает compiled CLI; MCP background jobs, exports и analytics пока не реализованы.

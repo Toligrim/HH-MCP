@@ -175,6 +175,27 @@ describe("search_vacancies", () => {
     expect(url).not.toContain("salary=");
   });
 
+  it("repeats multi-value query keys and reparses direct handler input", async () => {
+    mockHhGet.mockResolvedValueOnce({ items: [], found: 0, pages: 0, per_page: 20, page: 0 });
+    await handleSearchVacancies({ area: [1, "2"] } as never);
+    expect(new URLSearchParams(lastUrl().split("?")[1]).getAll("area")).toEqual(["1", "2"]);
+    await expect(handleSearchVacancies({ mystery: true } as never)).rejects.toThrow(/Unrecognized key/);
+    await expect(handleSearchVacancies({ currency: "USD" } as never)).rejects.toThrow(/currency requires salary/);
+    expect(mockHhGet).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves salary alias criteria and rejects contradictory/direct empty search filters before HH", async () => {
+    mockHhGet.mockResolvedValueOnce({ items: [], found: 0, pages: 0, per_page: 20, page: 0 });
+    await handleSearchVacancies({ with_salary: true, label: "night_shifts", area: "123", text: "  Go developer  " } as never);
+    const query = new URLSearchParams(lastUrl().split("?")[1]);
+    expect(query.getAll("label")).toEqual(["night_shifts", "with_salary"]);
+    expect(query.get("area")).toBe("123");
+    expect(query.get("text")).toBe("  Go developer  ");
+    await expect(handleSearchVacancies({ with_salary: false, label: "with_salary" } as never)).rejects.toThrow(/conflicting salary filters/);
+    await expect(handleSearchVacancies({ text: " \t " } as never)).rejects.toThrow(/empty or whitespace/);
+    expect(mockHhGet).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects period together with date_from/date_to", async () => {
     await expect(
       handleSearchVacancies({ period: 7, date_from: "2026-01-01", per_page: 20, page: 0 }),
@@ -1052,8 +1073,8 @@ describe("vacancy extras + saved searches", () => {
 });
 
 describe("tool registry", () => {
-  it("exposes 52 tools", () => {
-    expect(TOOL_COUNT).toBe(55);
+  it("exposes 61 tools", () => {
+    expect(TOOL_COUNT).toBe(61);
   });
 });
 

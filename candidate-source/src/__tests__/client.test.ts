@@ -238,33 +238,38 @@ describe("gated resume budget", () => {
   });
 
   it("makes the incident burst (30 views / 6s) impossible at defaults", async () => {
-    process.env.HH_RESUME_MIN_INTERVAL_MS = "1500";
-    process.env.HH_RESUME_MAX_CONCURRENCY = "1";
-    __resetResumeBudgetForTests();
-    mockFetch.mockResolvedValue(ok({}));
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+    try {
+      process.env.HH_RESUME_MIN_INTERVAL_MS = "1500";
+      process.env.HH_RESUME_MAX_CONCURRENCY = "1";
+      __resetResumeBudgetForTests();
+      mockFetch.mockResolvedValue(ok({}));
 
-    const started: number[] = [];
-    mockFetch.mockImplementation(() => {
-      started.push(Date.now());
-      return Promise.resolve(ok({}));
-    });
+      const started: number[] = [];
+      mockFetch.mockImplementation(() => {
+        started.push(Date.now());
+        return Promise.resolve(ok({}));
+      });
 
-    const ps = Array.from({ length: 5 }, (_, i) => hhGet(`/resumes/r${i}`));
-    // Advance enough for 5 * 1.5s
-    for (let i = 0; i < 10; i++) {
-      await vi.advanceTimersByTimeAsync(1500);
+      const ps = Array.from({ length: 5 }, (_, i) => hhGet(`/resumes/r${i}`));
+      // Advance enough for 5 * 1.5s
+      for (let i = 0; i < 10; i++) {
+        await vi.advanceTimersByTimeAsync(1500);
+      }
+      await Promise.all(ps);
+      expect(started.length).toBe(5);
+      expect(started[4]! - started[0]!).toBeGreaterThanOrEqual(1500 * 4);
+      // 5 starts with 1.5s spacing cannot fit in 6s for 30 views — density check:
+      const window = 6000;
+      let maxInWindow = 0;
+      for (let i = 0; i < started.length; i++) {
+        const end = started[i]! + window;
+        const count = started.filter((t) => t >= started[i]! && t <= end).length;
+        maxInWindow = Math.max(maxInWindow, count);
+      }
+      expect(maxInWindow).toBeLessThan(30);
+    } finally {
+      randomSpy.mockRestore();
     }
-    await Promise.all(ps);
-    expect(started.length).toBe(5);
-    expect(started[4]! - started[0]!).toBeGreaterThanOrEqual(1500 * 4);
-    // 5 starts with 1.5s spacing cannot fit in 6s for 30 views — density check:
-    const window = 6000;
-    let maxInWindow = 0;
-    for (let i = 0; i < started.length; i++) {
-      const end = started[i]! + window;
-      const count = started.filter((t) => t >= started[i]! && t <= end).length;
-      maxInWindow = Math.max(maxInWindow, count);
-    }
-    expect(maxInWindow).toBeLessThan(30);
   });
 });

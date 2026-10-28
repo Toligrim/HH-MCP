@@ -1,10 +1,21 @@
 #!/usr/bin/env node
 
 import http from "node:http";
-import type { ZodRawShape } from "zod";
+import { randomUUID } from "node:crypto";
+import { type ZodRawShape, type ZodObject } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  CancelledNotificationSchema,
+  ErrorCode,
+  isJSONRPCErrorResponse,
+  isJSONRPCNotification,
+  isJSONRPCResultResponse,
+  JSONRPCRequestSchema,
+  type JSONRPCMessage,
+} from "@modelcontextprotocol/sdk/types.js";
 import { VERSION } from "./version.js";
 import {
   searchVacanciesSchema,
@@ -132,7 +143,16 @@ import {
   handleGetSalaryStatistics,
 } from "./tools/salary.js";
 import { getClientHealth, HhAccessError, HhApiError } from "./client.js";
+import { HhBudgetError } from "./requestBudget.js";
 import { applyToolFilter, parseToolsCliArgs } from "./toolsFilter.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import {
+  deepSearchInputSchema, emptyInputSchema, explainSearchInputSchema,
+  getSearchCapabilityData, getVacanciesBatchInputSchema, handleDeepSearch,
+  handleExplainSearch, handleGetVacanciesBatchMcp, handlePlanSearch,
+  handleResolveSearchDictionary, planSearchInputSchema, resolveDictionaryInputSchema,
+  SearchToolError,
+} from "./tools/search.js";
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
@@ -140,13 +160,29 @@ type ToolResult = {
 };
 
 function wrapHandler(
-  fn: (params: any) => Promise<string>,
-): (params: any) => Promise<ToolResult> {
-  return async (params) => {
+  fn: (params: any, extra?: RequestHandlerExtra<any, any>) => Promise<string>,
+  safeErrors = false,
+): (params: any, extra?: RequestHandlerExtra<any, any>) => Promise<ToolResult> {
+  return async (params, extra) => {
     try {
-      const text = await fn(params);
+      const text = await fn(params, extra);
       return { content: [{ type: "text" as const, text }] };
     } catch (error) {
+      if (safeErrors) {
+        const runtimeError = error instanceof SearchToolError
+          ? { code: error.code, retryable: error.retryable, message: error.message, ...(error.status === undefined ? {} : { status: error.status }) }
+          : error instanceof HhAccessError
+              ? { code: "hh_access_error", retryable: false, status: error.status, message: error.message }
+              : error instanceof HhApiError
+                ? { code: "hh_api_error", retryable: error.status === 429 || error.status >= 500, status: error.status, message: error.message }
+                : error instanceof HhBudgetError
+                  ? { code: error.code, retryable: error.code === "cancelled", message: error.message }
+                  : error instanceof Error && error.name === "AbortError"
+                    ? { code: "cancelled", retryable: true, message: "Search request was cancelled." }
+                    : { code: "search_request_failed", retryable: false, message: error instanceof Error ? error.message : "Search request failed." };
+        runtimeError.message = runtimeError.message.slice(0, 500);
+        return { isError: true, content: [{ type: "text" as const, text: `ERROR: ${JSON.stringify(runtimeError)}` }] };
+      }
       if (error instanceof HhAccessError) {
         const structured = JSON.stringify(error.toStructured());
         return {
@@ -159,8 +195,9 @@ function wrapHandler(
           ],
         };
       }
-      const message =
-        error instanceof HhApiError
+      const message = safeErrors
+        ? error instanceof Error ? error.message : "Search request failed."
+        : error instanceof HhApiError
           ? `Error ${error.status}: ${error.message}${error.body ? `\n${error.body}` : ""}`
           : error instanceof Error
             ? error.message
@@ -178,8 +215,11 @@ function wrapHandler(
 interface ToolDef {
   name: string;
   description: string;
-  schema: ZodRawShape;
-  handler: (params: any) => Promise<string>;
+  schema: ZodRawShape | ZodObject<any>;
+  handler: (params: any, extra?: RequestHandlerExtra<any, any>) => Promise<string>;
+  fullSchema?: boolean;
+  safeErrors?: boolean;
+  readOnly?: boolean;
   group: string;
   groups?: string[];
 }
@@ -200,7 +240,8 @@ const ALL_TOOLS: ToolDef[] = [
       name: "search_vacancies",
       description:
         "Search job vacancies on hh.ru by keywords, region, professional role, industry, metro, salary, experience, employment form, work format, date range and labels. Returns a compact paginated summary (pass raw:true for full JSON).",
-      schema: searchVacanciesSchema.shape,
+      schema: searchVacanciesSchema,
+      fullSchema: true,
       handler: handleSearchVacancies,
     },
     {
@@ -592,6 +633,14 @@ const ALL_TOOLS: ToolDef[] = [
       handler: handleSuggestSkillSet,
     },
   ]),
+  ...g("search", [
+    { name: "plan_search", description: "Build a bounded search plan without making HH requests.", schema: planSearchInputSchema, handler: handlePlanSearch, fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "explain_search", description: "Explain how vacancy search inputs map to HH query parameters; does not execute a search.", schema: explainSearchInputSchema, handler: handleExplainSearch, fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "deep_search", description: "Collect a bounded, synchronous vacancy search with explicit coverage and uncertainty reporting.", schema: deepSearchInputSchema, handler: handleDeepSearch, fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "get_capabilities", description: "Describe enabled search tools, limits, and server capabilities.", schema: emptyInputSchema, handler: async () => JSON.stringify(getSearchCapabilityData(activeTools.map((tool) => tool.name), VERSION)), fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "resolve_search_dictionary", description: "Resolve a term against a bounded public HH search dictionary.", schema: resolveDictionaryInputSchema, handler: handleResolveSearchDictionary, fullSchema: true, safeErrors: true, readOnly: true },
+    { name: "get_vacancies_batch", description: "Fetch full vacancy cards for up to 20 vacancy IDs.", schema: getVacanciesBatchInputSchema, handler: handleGetVacanciesBatchMcp, fullSchema: true, safeErrors: true, readOnly: true },
+  ]),
   ...g("salary", [
     {
       name: "get_salary_statistics",
@@ -614,7 +663,7 @@ const ALL_TOOLS: ToolDef[] = [
 
 /** Unfiltered default surface (compile-time / test assertion). */
 export const DEFAULT_TOOL_NAMES = ALL_TOOLS.map((t) => t.name);
-export const DEFAULT_TOOL_COUNT = ALL_TOOLS.length; // 55 = 52 + 3
+export const DEFAULT_TOOL_COUNT = ALL_TOOLS.length;
 
 let activeTools: ToolDef[] = ALL_TOOLS;
 let filterMeta = {
@@ -646,9 +695,17 @@ export function createServer(): McpServer {
   const server = new McpServer({
     name: "hh-mcp",
     version: VERSION,
-  });
+  }, { maxToolInputElements: 20_000 });
   for (const tool of activeTools) {
-    server.tool(tool.name, tool.description, tool.schema, wrapHandler(tool.handler));
+    if (tool.fullSchema) {
+      server.registerTool(tool.name, {
+        description: tool.description,
+        inputSchema: tool.schema as ZodObject<any>,
+        ...(tool.readOnly ? { annotations: { readOnlyHint: true } } : {}),
+      }, async (params, extra) => wrapHandler(tool.handler, tool.safeErrors)(params, extra));
+    } else {
+      server.tool(tool.name, tool.description, tool.schema as ZodRawShape, wrapHandler(tool.handler));
+    }
   }
   return server;
 }
@@ -669,35 +726,607 @@ export function getHealthPayload(): Record<string, unknown> {
 
 // --- HTTP body reader (stateless transport needs the parsed body) ---
 
-const MAX_BODY = 4 * 1024 * 1024;
+const MAX_BODY = 256 * 1024;
+const MAX_JSON_DEPTH = 64;
+
+class HttpInputError extends Error {
+  constructor(readonly status: 400 | 413, message: string) {
+    super(message);
+  }
+}
+
+function assertJsonDepth(raw: string): void {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (const character of raw) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') inString = true;
+    else if (character === "{" || character === "[") {
+      depth++;
+      if (depth > MAX_JSON_DEPTH) {
+        throw new HttpInputError(400, "Request JSON nesting exceeds the maximum depth.");
+      }
+    } else if (character === "}" || character === "]") {
+      depth = Math.max(0, depth - 1);
+    }
+  }
+}
 
 function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let settled = false;
+    const rejectInput = (error: HttpInputError) => {
+      if (settled) return;
+      settled = true;
+      req.pause();
+      reject(error);
+    };
+
+    const declaredLength = Number(req.headers["content-length"]);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY) {
+      rejectInput(new HttpInputError(413, "Request body exceeds the 256 KiB limit."));
+      return;
+    }
+
     req.on("data", (chunk: Buffer) => {
+      if (settled) return;
       size += chunk.length;
       if (size > MAX_BODY) {
-        reject(new Error("Request body too large"));
-        req.destroy();
+        rejectInput(new HttpInputError(413, "Request body exceeds the 256 KiB limit."));
         return;
       }
       chunks.push(chunk);
     });
     req.on("end", () => {
+      if (settled) return;
       const raw = Buffer.concat(chunks).toString("utf8");
       if (!raw) {
+        settled = true;
         resolve(undefined);
         return;
       }
       try {
+        assertJsonDepth(raw);
+        settled = true;
         resolve(JSON.parse(raw));
-      } catch (err) {
-        reject(err);
+      } catch (error) {
+        settled = true;
+        reject(error instanceof HttpInputError
+          ? error
+          : new HttpInputError(400, "Invalid JSON request body."));
       }
     });
-    req.on("error", reject);
+    req.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
   });
+}
+
+const DEFAULT_HTTP_SESSION_LIMIT = 128;
+const DEFAULT_HTTP_SESSION_IDLE_MS = 15 * 60 * 1000;
+const DEFAULT_HTTP_SESSION_ACTIVE_LIMIT = 32;
+const MCP_SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+type HttpMcpSession = {
+  id?: string;
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+  activeRequests: number;
+  controlRequests: number;
+  requestGroups: Set<HttpMcpRequestGroup>;
+  requestGroupsById: Map<string | number, HttpMcpRequestGroup>;
+  internalRequestIdToWireId: Map<string, string | number>;
+  reservationHeld: boolean;
+  closed: boolean;
+  idleTimer?: NodeJS.Timeout;
+};
+
+type HttpMcpRequestGroup = {
+  response: http.ServerResponse;
+  requestIds: Set<string | number>;
+  internalRequestIdsByWireId: Map<string | number, string>;
+  cancelledIds: Set<string | number>;
+  completedIds: Set<string | number>;
+  cancellationResponsesSent: Set<string | number>;
+  cleanupStarted: boolean;
+};
+
+export type HttpMcpServerOptions = {
+  port?: number;
+  allowedHosts?: string[];
+  allowedOrigins?: string[];
+  maxSessions?: number;
+  maxActiveRequestsPerSession?: number;
+  sessionIdleTimeoutMs?: number;
+};
+
+const httpSessionClosers = new WeakMap<http.Server, () => Promise<void>>();
+
+function messagesFromBody(body: unknown): unknown[] {
+  return Array.isArray(body) ? body : [body];
+}
+
+function isInitializeBody(body: unknown): boolean {
+  return messagesFromBody(body).some((message) => message !== null && typeof message === "object" &&
+    (message as Record<string, unknown>).method === "initialize");
+}
+
+function requestIdsFromBody(body: unknown): Array<string | number> {
+  return messagesFromBody(body).flatMap((message) => {
+    const parsed = JSONRPCRequestSchema.safeParse(message);
+    return parsed.success ? [parsed.data.id] : [];
+  });
+}
+
+function validatedCancellationRequestId(message: unknown): string | number | undefined {
+  if (!isJSONRPCNotification(message)) return undefined;
+  const parsed = CancelledNotificationSchema.safeParse(message);
+  if (!parsed.success) return undefined;
+  const requestId = parsed.data.params.requestId;
+  return typeof requestId === "string" || typeof requestId === "number" ? requestId : undefined;
+}
+
+function createSessionSdkTransport(session: HttpMcpSession): Transport {
+  const transport = session.transport;
+  // The SDK's cancellation handler treats numeric 0 as absent; translate it only inside this session.
+  const internalMessageToSdk = (message: JSONRPCMessage): JSONRPCMessage => {
+    const request = JSONRPCRequestSchema.safeParse(message);
+    if (request.success) {
+      const internalId = session.requestGroupsById.get(request.data.id)?.internalRequestIdsByWireId.get(request.data.id);
+      return internalId === undefined ? message : { ...message, id: internalId } as JSONRPCMessage;
+    }
+    const requestId = validatedCancellationRequestId(message);
+    if (requestId === undefined) return message;
+    const group = session.requestGroupsById.get(requestId);
+    const internalId = group?.internalRequestIdsByWireId.get(requestId);
+    if (!group || internalId === undefined || group.completedIds.has(requestId) || group.cancelledIds.has(requestId)) return message;
+    const notification = message as Record<string, unknown>;
+    const params = notification.params as Record<string, unknown>;
+    return { ...notification, params: { ...params, requestId: internalId } } as unknown as JSONRPCMessage;
+  };
+  const internalIdToWireId = (id: string | number | undefined): string | number | undefined =>
+    typeof id === "string" ? session.internalRequestIdToWireId.get(id) : undefined;
+  const messageToWire = (message: JSONRPCMessage): JSONRPCMessage => {
+    if (isJSONRPCErrorResponse(message) || isJSONRPCResultResponse(message)) {
+      const wireId = internalIdToWireId(message.id);
+      return wireId === undefined ? message : { ...message, id: wireId } as JSONRPCMessage;
+    }
+    const record = message as Record<string, unknown>;
+    const params = record.params;
+    if (!params || typeof params !== "object" || Array.isArray(params)) return message;
+    const relatedRequestId = (params as Record<string, unknown>).relatedRequestId;
+    const wireId = internalIdToWireId(typeof relatedRequestId === "string" ? relatedRequestId : undefined);
+    return wireId === undefined
+      ? message
+      : { ...record, params: { ...(params as Record<string, unknown>), relatedRequestId: wireId } } as unknown as JSONRPCMessage;
+  };
+  const optionsToWire = (options?: TransportSendOptions): TransportSendOptions | undefined => {
+    if (typeof options?.relatedRequestId !== "string") return options;
+    const wireId = internalIdToWireId(options.relatedRequestId);
+    return wireId === undefined ? options : { ...options, relatedRequestId: wireId };
+  };
+
+  const sdkTransport: Transport = {
+    get sessionId() { return transport.sessionId; },
+    async start() {
+      transport.onmessage = (message, extra) => sdkTransport.onmessage?.(internalMessageToSdk(message), extra);
+      transport.onerror = (error) => sdkTransport.onerror?.(error);
+      transport.onclose = () => sdkTransport.onclose?.();
+      await transport.start();
+    },
+    send(message, options) {
+      return transport.send(messageToWire(message), optionsToWire(options));
+    },
+    close() {
+      return transport.close();
+    },
+  };
+  return sdkTransport;
+}
+
+function isCancellationOnlyPayload(body: unknown): boolean {
+  const messages = messagesFromBody(body);
+  return messages.length === 1 && validatedCancellationRequestId(messages[0]) !== undefined;
+}
+
+function writeJsonRpcError(res: http.ServerResponse, status: number, code: number, message: string): void {
+  if (res.headersSent) return;
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    ...(status === 413 ? { Connection: "close" } : {}),
+  });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }), () => {
+    if (status === 413) res.req.destroy();
+  });
+}
+
+export async function closeHttpMcpSessions(server: http.Server): Promise<void> {
+  await httpSessionClosers.get(server)?.();
+}
+
+export function createHttpServer(options: HttpMcpServerOptions = {}): http.Server {
+  const port = options.port ?? Number(process.env.HTTP_PORT || process.env.PORT || 3000);
+  const allowedHosts = options.allowedHosts ?? (process.env.HH_ALLOWED_HOSTS || `127.0.0.1:${port},localhost:${port}`)
+    .split(",").map((value) => value.trim()).filter(Boolean);
+  const configuredOrigins = options.allowedOrigins ?? (process.env.HH_ALLOWED_ORIGINS
+    ? process.env.HH_ALLOWED_ORIGINS.split(",").map((value) => value.trim()).filter(Boolean)
+    : undefined);
+  const maxSessions = options.maxSessions ?? DEFAULT_HTTP_SESSION_LIMIT;
+  const maxActiveRequestsPerSession = options.maxActiveRequestsPerSession ?? DEFAULT_HTTP_SESSION_ACTIVE_LIMIT;
+  const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? DEFAULT_HTTP_SESSION_IDLE_MS;
+  if (!Number.isSafeInteger(maxSessions) || maxSessions < 1) throw new RangeError("maxSessions must be a positive safe integer");
+  if (!Number.isSafeInteger(maxActiveRequestsPerSession) || maxActiveRequestsPerSession < 1) throw new RangeError("maxActiveRequestsPerSession must be a positive safe integer");
+  if (!Number.isSafeInteger(sessionIdleTimeoutMs) || sessionIdleTimeoutMs < 1) throw new RangeError("sessionIdleTimeoutMs must be a positive safe integer");
+
+  const sessions = new Map<string, HttpMcpSession>();
+  const trackedSessions = new Set<HttpMcpSession>();
+  let pendingSessionInitializations = 0;
+  let shuttingDown = false;
+
+  const removeSessionEntry = (session: HttpMcpSession): void => {
+    if (session.id && sessions.get(session.id) === session) sessions.delete(session.id);
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = undefined;
+    if (session.reservationHeld) {
+      pendingSessionInitializations = Math.max(0, pendingSessionInitializations - 1);
+      session.reservationHeld = false;
+    }
+    session.closed = true;
+    trackedSessions.delete(session);
+  };
+
+  const disposeSession = async (session: HttpMcpSession): Promise<void> => {
+    if (session.closed) return;
+    removeSessionEntry(session);
+    await session.server.close().catch(() => undefined);
+  };
+
+  const scheduleSessionExpiry = (session: HttpMcpSession): void => {
+    if (!session.id || session.activeRequests + session.controlRequests > 0 || session.closed || sessions.get(session.id) !== session) return;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = setTimeout(() => { void disposeSession(session); }, sessionIdleTimeoutMs);
+    session.idleTimer.unref?.();
+  };
+
+  const createStatefulSession = (): HttpMcpSession => {
+    const server = createServer();
+    const sessionRef: { current?: HttpMcpSession } = {};
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: randomUUID,
+      onsessioninitialized: (id) => {
+        const session = sessionRef.current!;
+        if (session.reservationHeld) {
+          pendingSessionInitializations = Math.max(0, pendingSessionInitializations - 1);
+          session.reservationHeld = false;
+        }
+        if (shuttingDown || session.closed) return;
+        session.id = id;
+        sessions.set(id, session);
+      },
+      onsessionclosed: async () => {
+        const session = sessionRef.current;
+        if (!session) return;
+        removeSessionEntry(session);
+        await session.server.close().catch(() => undefined);
+      },
+      enableDnsRebindingProtection: true,
+      maxRequestBodySize: MAX_BODY,
+      allowedHosts,
+      ...(configuredOrigins ? { allowedOrigins: configuredOrigins } : {}),
+    });
+    const session: HttpMcpSession = {
+      server,
+      transport,
+      activeRequests: 0,
+      controlRequests: 0,
+      requestGroups: new Set(),
+      requestGroupsById: new Map(),
+      internalRequestIdToWireId: new Map(),
+      reservationHeld: true,
+      closed: false,
+    };
+    sessionRef.current = session;
+    trackedSessions.add(session);
+    return session;
+  };
+
+  const removeRequestGroup = (session: HttpMcpSession, group: HttpMcpRequestGroup): void => {
+    session.requestGroups.delete(group);
+    for (const requestId of group.requestIds) {
+      if (session.requestGroupsById.get(requestId) === group) session.requestGroupsById.delete(requestId);
+      const internalId = group.internalRequestIdsByWireId.get(requestId);
+      if (internalId !== undefined) session.internalRequestIdToWireId.delete(internalId);
+    }
+  };
+
+  const cancelledRequestError = (requestId: string | number) => ({
+    jsonrpc: "2.0" as const,
+    id: requestId,
+    error: { code: ErrorCode.ConnectionClosed, message: "Request cancelled." },
+  });
+
+  const settleCancelledGroup = async (session: HttpMcpSession, group: HttpMcpRequestGroup): Promise<void> => {
+    if (group.cleanupStarted || group.cancelledIds.size === 0) return;
+    const pendingSiblingIds = [...group.requestIds].filter((id) => !group.cancelledIds.has(id) && !group.completedIds.has(id));
+    const transportSend = session.transport.send.bind(session.transport);
+
+    if (pendingSiblingIds.length > 0 && !group.response.destroyed && !group.response.writableFinished) {
+      for (const requestId of group.cancelledIds) {
+        if (group.cancellationResponsesSent.has(requestId)) continue;
+        group.cancellationResponsesSent.add(requestId);
+        try {
+          await transportSend(cancelledRequestError(requestId));
+        } catch {
+          group.cancellationResponsesSent.delete(requestId);
+        }
+      }
+      if ([...group.requestIds].every((id) => group.completedIds.has(id) || group.cancellationResponsesSent.has(id))) {
+        removeRequestGroup(session, group);
+      }
+      return;
+    }
+
+    group.cleanupStarted = true;
+    for (const requestId of group.cancelledIds) session.transport.closeSSEStream(requestId);
+    for (const requestId of group.cancelledIds) {
+      if (group.cancellationResponsesSent.has(requestId)) continue;
+      try {
+        // The stream is already closed, so this releases SDK request correlation without writing after cancellation.
+        await transportSend(cancelledRequestError(requestId));
+      } catch {
+        // The SDK's public send path removes correlations before reporting that the stream is gone.
+      }
+    }
+    removeRequestGroup(session, group);
+  };
+
+  const handleSessionRequest = async (session: HttpMcpSession, req: http.IncomingMessage, res: http.ServerResponse, body?: unknown, readBody = false): Promise<void> => {
+    const isDelete = req.method === "DELETE";
+    let countedAsActive = false;
+    let reservedControlSlot = false;
+    if (!isDelete) {
+      if (session.activeRequests >= maxActiveRequestsPerSession) {
+        if (session.controlRequests > 0) {
+          writeJsonRpcError(res, 429, -32000, "This MCP session has reached its active request limit.");
+          return;
+        }
+        session.controlRequests++;
+        reservedControlSlot = true;
+      } else {
+        session.activeRequests++;
+        countedAsActive = true;
+      }
+      if (session.idleTimer) clearTimeout(session.idleTimer);
+      session.idleTimer = undefined;
+    }
+    try {
+      const payload = readBody && req.method === "POST" ? await readJsonBody(req) : body;
+      if (reservedControlSlot && !isCancellationOnlyPayload(payload)) {
+        writeJsonRpcError(res, 429, -32000, "This MCP session has reached its active request limit.");
+        return;
+      }
+      if (res.destroyed) return;
+      const requestIds = requestIdsFromBody(payload);
+      if (requestIds.some((requestId) => session.requestGroupsById.has(requestId))) {
+        writeJsonRpcError(res, 400, -32600, "A JSON-RPC request ID is already active in this MCP session.");
+        return;
+      }
+      const requestGroup: HttpMcpRequestGroup | undefined = requestIds.length > 0
+        ? {
+            response: res,
+            requestIds: new Set(requestIds),
+            internalRequestIdsByWireId: new Map(),
+            cancelledIds: new Set(),
+            completedIds: new Set(),
+            cancellationResponsesSent: new Set(),
+            cleanupStarted: false,
+          }
+        : undefined;
+      if (requestGroup) {
+        for (const requestId of requestGroup.requestIds) {
+          if (requestId !== 0) continue;
+          // Keep the HTTP wire ID for transport routing and expose a truthy SDK-only alias.
+          const internalId = `mcp-http-zero-${randomUUID()}`;
+          requestGroup.internalRequestIdsByWireId.set(requestId, internalId);
+          session.internalRequestIdToWireId.set(internalId, requestId);
+        }
+        session.requestGroups.add(requestGroup);
+        for (const requestId of requestGroup.requestIds) session.requestGroupsById.set(requestId, requestGroup);
+      }
+      res.once("close", () => {
+        if (res.writableFinished) {
+          if (requestGroup) removeRequestGroup(session, requestGroup);
+          return;
+        }
+        if (requestGroup) {
+          for (const requestId of requestGroup.requestIds) {
+            if (requestGroup.completedIds.has(requestId) || requestGroup.cancelledIds.has(requestId)) continue;
+            session.transport.onmessage?.({
+              jsonrpc: "2.0",
+              method: "notifications/cancelled",
+              params: { requestId, reason: "HTTP response closed" },
+            });
+          }
+          if (requestGroup.cancelledIds.size > 0) queueMicrotask(() => { void settleCancelledGroup(session, requestGroup); });
+        }
+      });
+      await session.transport.handleRequest(req, res, payload);
+      if (requestGroup && res.writableFinished) removeRequestGroup(session, requestGroup);
+    } finally {
+      if (countedAsActive) session.activeRequests = Math.max(0, session.activeRequests - 1);
+      if (reservedControlSlot) session.controlRequests = Math.max(0, session.controlRequests - 1);
+      if (!isDelete) scheduleSessionExpiry(session);
+    }
+  };
+
+  const installCancellationStreamCleanup = (session: HttpMcpSession): void => {
+    const dispatchMessage = session.transport.onmessage;
+    const dispatchSend = session.transport.send.bind(session.transport);
+    session.transport.send = async (message, options) => {
+      const result = await dispatchSend(message, options);
+      if (isJSONRPCErrorResponse(message) || isJSONRPCResultResponse(message)) {
+        const responseId = message.id;
+        if (typeof responseId === "string" || typeof responseId === "number") {
+          const group = session.requestGroupsById.get(responseId);
+          if (group) {
+            group.completedIds.add(responseId);
+            if (group.cancelledIds.size > 0) {
+              queueMicrotask(() => { void settleCancelledGroup(session, group); });
+            } else if ([...group.requestIds].every((id) => group.completedIds.has(id))) {
+              removeRequestGroup(session, group);
+            }
+          }
+        }
+      }
+      return result;
+    };
+    session.transport.onmessage = (message, extra) => {
+      dispatchMessage?.(message, extra);
+      const requestId = validatedCancellationRequestId(message);
+      if (requestId === undefined) return;
+      const group = session.requestGroupsById.get(requestId);
+      if (!group || group.completedIds.has(requestId) || group.cancelledIds.has(requestId)) return;
+      group.cancelledIds.add(requestId);
+      queueMicrotask(() => { void settleCancelledGroup(session, group); });
+    };
+  };
+
+  const handleStatelessRequest = async (req: http.IncomingMessage, res: http.ServerResponse, body: unknown): Promise<void> => {
+    const server = createServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableDnsRebindingProtection: true,
+      maxRequestBodySize: MAX_BODY,
+      allowedHosts,
+      ...(configuredOrigins ? { allowedOrigins: configuredOrigins } : {}),
+    });
+    res.once("close", () => {
+      if (!res.writableFinished) void server.close().catch(() => undefined);
+    });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  };
+
+  const httpServer = http.createServer(async (req, res) => {
+    let url: URL;
+    try {
+      url = new URL(req.url || "/", "http://localhost");
+    } catch {
+      writeJsonRpcError(res, 400, -32700, "Invalid request target.");
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(getHealthPayload()));
+      return;
+    }
+    if (url.pathname !== "/mcp") {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Not found. Use POST /mcp for the MCP protocol or GET /health for a health check.");
+      return;
+    }
+    if (req.method !== "POST" && req.method !== "DELETE") {
+      res.writeHead(405, { "Content-Type": "application/json", Allow: "POST, DELETE" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. Use POST /mcp." }, id: null }));
+      return;
+    }
+
+    const requestHost = req.headers.host;
+    const origin = req.headers.origin;
+    if (allowedHosts.length > 0 && (!requestHost || !allowedHosts.includes(requestHost))) {
+      writeJsonRpcError(res, 403, -32000, "Invalid Host header.");
+      return;
+    }
+    if (configuredOrigins && origin && !configuredOrigins.includes(origin)) {
+      writeJsonRpcError(res, 403, -32000, "Invalid Origin header.");
+      return;
+    }
+    if (shuttingDown) {
+      writeJsonRpcError(res, 503, -32000, "MCP server is shutting down.");
+      return;
+    }
+
+    const rawSessionId = req.headers["mcp-session-id"];
+    let session: HttpMcpSession | undefined;
+    if (rawSessionId !== undefined) {
+      if (typeof rawSessionId !== "string" || !MCP_SESSION_ID_PATTERN.test(rawSessionId)) {
+        writeJsonRpcError(res, 400, -32000, "Invalid MCP session identifier.");
+        return;
+      }
+      session = sessions.get(rawSessionId);
+      if (!session || session.closed) {
+        writeJsonRpcError(res, 404, -32001, "Session not found.");
+        return;
+      }
+    }
+
+    try {
+      if (req.method === "DELETE") {
+        if (!session) {
+          res.writeHead(405, { "Content-Type": "application/json", Allow: "POST, DELETE" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "A session identifier is required." }, id: null }));
+          return;
+        }
+        await handleSessionRequest(session, req, res);
+        return;
+      }
+
+      if (session) {
+        await handleSessionRequest(session, req, res, undefined, true);
+        return;
+      }
+      const body = await readJsonBody(req);
+      if (isInitializeBody(body)) {
+        if (shuttingDown || sessions.size + pendingSessionInitializations >= maxSessions) {
+          writeJsonRpcError(res, 503, -32000, "MCP session capacity is temporarily full.");
+          return;
+        }
+        pendingSessionInitializations++;
+        const newSession = createStatefulSession();
+        try {
+          await newSession.server.connect(createSessionSdkTransport(newSession));
+          installCancellationStreamCleanup(newSession);
+          await handleSessionRequest(newSession, req, res, body);
+        } finally {
+          if (newSession.reservationHeld) {
+            pendingSessionInitializations = Math.max(0, pendingSessionInitializations - 1);
+            newSession.reservationHeld = false;
+          }
+          if (!newSession.id && !newSession.closed) await disposeSession(newSession);
+        }
+        return;
+      }
+      await handleStatelessRequest(req, res, body);
+    } catch (error) {
+      const inputError = error instanceof HttpInputError ? error : undefined;
+      if (!inputError) console.error("[hh-mcp] HTTP request failed.");
+      writeJsonRpcError(res, inputError?.status ?? 500,
+        inputError?.status === 400 ? -32700 : inputError?.status === 413 ? -32000 : -32603,
+        inputError?.message ?? "Internal server error");
+    }
+  });
+
+  const closeSessions = async (): Promise<void> => {
+    shuttingDown = true;
+    await Promise.all([...trackedSessions].map((session) => disposeSession(session)));
+  };
+  httpSessionClosers.set(httpServer, closeSessions);
+  httpServer.once("close", () => { void closeSessions(); });
+  return httpServer;
 }
 
 // --- Start ---
@@ -717,8 +1346,6 @@ async function main() {
 
   if (httpMode) {
     const host = process.env.HOST || "127.0.0.1";
-    // DNS-rebinding protection (off by default in the SDK, CVE-2025-66414):
-    // only accept requests whose Host header is in this allow-list.
     const allowedHosts = (
       process.env.HH_ALLOWED_HOSTS ||
       `127.0.0.1:${port},localhost:${port}`
@@ -729,64 +1356,7 @@ async function main() {
     const allowedOrigins = process.env.HH_ALLOWED_ORIGINS
       ? process.env.HH_ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean)
       : undefined;
-
-    const httpServer = http.createServer(async (req, res) => {
-      const url = new URL(req.url || "/", `http://${req.headers.host || `${host}:${port}`}`);
-
-      if (req.method === "GET" && url.pathname === "/health") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(getHealthPayload()));
-        return;
-      }
-
-      if (url.pathname === "/mcp") {
-        if (req.method !== "POST") {
-          res.writeHead(405, { "Content-Type": "application/json", Allow: "POST" });
-          res.end(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              error: { code: -32000, message: "Method not allowed. Use POST /mcp." },
-              id: null,
-            }),
-          );
-          return;
-        }
-        // Stateless: a fresh server + transport per request avoids the
-        // single-shared-transport concurrency bug. Torn down on response close.
-        const server = createServer();
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-          enableDnsRebindingProtection: true,
-          allowedHosts,
-          ...(allowedOrigins ? { allowedOrigins } : {}),
-        });
-        res.on("close", () => {
-          transport.close();
-          server.close();
-        });
-        try {
-          await server.connect(transport);
-          const body = await readJsonBody(req);
-          await transport.handleRequest(req, res, body);
-        } catch (err) {
-          console.error("[hh-mcp] request error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                jsonrpc: "2.0",
-                error: { code: -32603, message: "Internal server error" },
-                id: null,
-              }),
-            );
-          }
-        }
-        return;
-      }
-
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Not found. Use POST /mcp for the MCP protocol or GET /health for a health check.");
-    });
+    const httpServer = createHttpServer({ port, allowedHosts, allowedOrigins });
 
     httpServer.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
@@ -806,7 +1376,9 @@ async function main() {
       );
     });
 
-    const shutdown = () => httpServer.close(() => process.exit(0));
+    const shutdown = () => {
+      void closeHttpMcpSessions(httpServer).finally(() => httpServer.close(() => process.exit(0)));
+    };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
   } else {
