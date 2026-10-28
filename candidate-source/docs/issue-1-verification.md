@@ -2,6 +2,55 @@
 
 This is a development candidate at version `3.2.0-search.1`. Stages 0–3 are implemented in the candidate. Server-side exports, background jobs, and analytics (stages 4–5) are deferred. This record supports review of the feature branch; no merge or deployment is claimed. The root `build-output/` and `SOURCE-CANDIDATE.txt` remain the historical deployment baseline; `candidate-source/dist/` is generated output for this candidate. Existing upstream attribution and MIT license are retained.
 
+## PR 2 areas dictionary fix — 2026-10-28
+
+Live preflight confirmed `Toligrim/HH-MCP`, feature branch `feat/issue-1-search-engine`, OPEN/DRAFT PR #2 and a clean working tree at `7538d2a8fd627b1333d48cd2ca1cdf31a90af77d`. Base remains `ops/preflight-2026-10-13` / `f3f1dcfd4f6cc36c26b52d027d38ded8c86e2468`. The source/test fix is commit **`961a3a46ff7ed2c27a7ff37d6bfb4db4d204e7db`**; this documentation update does not change that tested product. The subsequent dated sections retain historical results and limitations.
+
+### Cause and bounded change
+
+The saved integration reports from 27–28 October confirmed that HTTP 200 `/areas` returned 2,669,147 JSON bytes, exceeding the resolver's 2,097,152-byte upstream budget. This cycle reproduced the defect with a generated approximately 2.65 MB JSON response before changing the handler. It also confirmed that the dictionary catch erased `HhBudgetError`, losing the existing structured MCP error mapping.
+
+Only `resolve_search_dictionary` with `dictionary: "areas"` now receives **4,194,304 upstream bytes**. Every other dictionary keeps **2,097,152 bytes**. Both retain one HTTP attempt, the 20-second deadline, caller cancellation, actual response-byte accounting, cache/lookup behaviour and the existing compact dictionary projection. Budget errors retain their type and use the existing MCP mapper. There is no change to the HTTP input limit (256 KiB), input nesting limit (64), SDK element limit (20,000), MCP tool-output limit (64 KiB), or the budgets of `deep_search`, `get_vacancies_batch` and legacy tools.
+
+A coordinator check and independent Luna 6 review confirmed an additional required error-handling case: Node's JSON `SyntaxError` can quote a prefix of a malformed upstream body. The strengthened test reproduced that prefix leak before a dictionary-local fix. Such parse errors now return a fixed `search_request_failed` message with no body excerpt. Shared client code and other tools are unchanged.
+
+Changed files in this cycle:
+
+- `candidate-source/src/tools/search.ts`
+- `candidate-source/src/tools/__tests__/search-mcp.test.ts`
+- `candidate-source/docs/issue-1-verification.md`
+
+### Actual verification
+
+Commands ran in `candidate-source/` on Node **22.23.1**, npm **10.9.8**, SDK **1.32.2**, Zod **4.6.6**, candidate **3.2.0-search.1**. The final working content tested below was compared by SHA-256 against every tracked candidate file in source commit `961a3a46ff7ed2c27a7ff37d6bfb4db4d204e7db`; all matched. Only documentation follows that source commit.
+
+| Check | Actual result |
+|---|---|
+| `npm ci` | PASS, exit 0; 244 packages installed. Package manifests and lockfile unchanged. |
+| `npm run typecheck` | PASS, exit 0; 15.224 s. |
+| `npm run lint` | PASS, exit 0; 13.477 s. |
+| `npm test` | PASS, exit 0; **17 files / 306 tests**, Vitest 19.79 s, command wall 21.129 s. Previous 303 tests retained; three added tests cover multiple dictionary scenarios. |
+| `npm run build` | PASS, exit 0; 8.724 s. |
+| `git diff --check` | PASS, exit 0. |
+| Targeted SDK/dictionary/request-budget files | PASS, **43/43**; real SDK InMemoryTransport plus mocked upstream fetch and real byte-budget code. |
+| Large areas / Moscow / compact MCP output | PASS: generated >2 MiB response resolves region ID `1`; tool text remains at most 64 KiB. |
+| Areas >4 MiB; metro >2 MiB | PASS: structured `byte_budget`, non-retryable errors; no global budget increase. |
+| Cancellation / subsequent request | PASS: abort reaches upstream signal, pending SDK call settles, next dictionary request succeeds. |
+| HH errors / malformed JSON | PASS: structured HH error without body echo, and fixed parse-error message without even the fixture's body prefix. |
+| Compatibility and HTTP transport | PASS in the full suite: legacy scalar/default/raw search, deep search, published schemas, actual Streamable HTTP SDK transport, input size/depth/elements, cancellation, CLI/checkpoints and synthetic collection. |
+
+Initial RED logs contain the expected large-areas/structured-budget failures before implementation. A separate strengthened invalid-JSON test failed with the echoed body prefix before sanitization, then passed. The first combined targeted run also exposed fake-clock state leaking into the existing rate limiter; test teardown now restores real timers and the existing limiter test state. The full pre-review run was 306/306; it was repeated after the parse-error fix, yielding the final results above. The superseded run is retained as evidence rather than presented as final verification.
+
+`npm ci`'s automatic audit reported **10 existing findings** (1 low, 1 moderate, 6 high, 2 critical). No dependency was upgraded, no `npm audit fix` was used, and no dedicated current full/runtime audit was run in this narrow cycle. The older dedicated audit and its dev-only classification remain historical in the section below; these findings are not claimed resolved here.
+
+### Delegation, review and operational limits
+
+One Luna 6 combined diagnosis, test-first implementation and targeted checks; a separate Luna 6 performed a read-only review of the complete fix diff against `7538d2a8fd627b1333d48cd2ca1cdf31a90af77d`. The coordinator inspected the actual diff, RED/GREEN evidence, command exit codes and committed content. The invalid-JSON Important finding was reproduced, repaired and independently re-reviewed; no open Critical/Important/Minor findings remain in the source/test fix. This scoped review does not re-certify the entire historical PR. Superpowers systematic-debugging, test-driven-development, requesting-code-review and verification-before-completion guided this cycle.
+
+**New real HH requests: 0.** All new responses were mocked/generated. There was no production launch, token change, Actions run, network/service configuration change, merge or deployment. Before and after the final local checks, production remained at `98f9930a1bbeeed44572986c7d72b197cacc93e2`; 79 protected file hashes, service identities/restart counters and the actual `HH_TOOLS` allow-list were unchanged. Production source was not edited. Verification evidence/logs are saved locally in `validation/pr2-areas-fix-2026-10-28/` outside the feature worktree; no credentials were supplied to the test commands.
+
+The area-budget blocker is resolved in synthetic SDK tests. A new live retest and staging OAuth/ChatGPT E2E were **not performed**; staging remains a separate stage requiring owner authorization. This is a verified Draft PR candidate, not release approval. **MERGE: NO. DEPLOY: NO.**
+
 ## PR 2 independent-review fixes — 2026-10-27
 
 This cycle starts at PR HEAD `21e096539e128660bdf00c403998d8b015d2c2c7` on `feat/issue-1-search-engine`. The base remains `ops/preflight-2026-10-13` at `f3f1dcfd4f6cc36c26b52d027d38ded8c86e2468`. Live GitHub preflight confirmed the repository, exact refs and open/draft status before edits. GitHub submitted-review and inline-thread lists were empty; the owner's supplied independent findings, prior verification record and commit history were used as the review inputs. Work remains in existing [PR #2](https://github.com/Toligrim/HH-MCP/pull/2).
